@@ -53,58 +53,33 @@ jobs:
         }
 
         $deps = @(
-          @{ Name = 'Visual Studio 2022 Build Tools (aarch64)'; Hash = $null;
-            Url = 'https://aka.ms/vs/17/release/vs_buildtools.exe';
-            Args = @('--add', 'Microsoft.VisualStudio.Component.VC.Tools.ARM64',
-                     '--add', 'Microsoft.VisualStudio.Component.Windows11SDK.22621',
-                     '--quiet', '--wait', '--norestart', '--nocache') },
-          @{ Name = 'Git 2.48.0-rc1'; 
-            Url = "${{github.workspace}}/Git-2.48.0-rc2-arm64.exe";
-            Hash = '712739bb49832d571732e3e74b111d7cb4a63cd622ef3e87d01efe35046d9a4f';
-            Args = @('/VERYSILENT', '/GitAndUnixToolsOnPath', '/NoAutoCrlf') },
-          @{ Name = 'LLVM 19.1.5'; 
-            Url = "${{github.workspace}}/LLVM-19.1.5-woa64.exe";
-            Hash = '63D479C19C3908F8C973331EDC9B576485EAB6AB0809F58C79DF5D209FDD8F96';
-            Args = @('/S') },
+          @{ Name = 'Visual Studio 2022 Build Tools (aarch64)';
+             Url = 'https://aka.ms/vs/17/release/vs_buildtools.exe';
+             Args = @('--add', 'Microsoft.VisualStudio.Component.VC.Tools.ARM64',
+                      '--add', 'Microsoft.VisualStudio.Component.Windows11SDK.22621',
+                      '--quiet', '--wait', '--norestart', '--nocache') },
+          @{ Name = 'Git 2.48.0-rc1';
+             Url = "${{github.workspace}}/Git-2.48.0-rc2-arm64.exe";
+             Args = @('/VERYSILENT', '/GitAndUnixToolsOnPath', '/NoAutoCrlf') },
+          @{ Name = 'LLVM 19.1.5';
+             Url = "${{github.workspace}}/LLVM-19.1.5-woa64.exe";
+             Args = @('/S') },
           @{ Name = 'Rust (nightly, aarch64)';
-            Url = 'https://static.rust-lang.org/rustup/dist/aarch64-pc-windows-msvc/rustup-init.exe';
-            Hash = 'https://static.rust-lang.org/rustup/dist/aarch64-pc-windows-msvc/rustup-init.exe.sha256';
-            Args = @('--default-host', 'aarch64-pc-windows-msvc', '--default-toolchain', 'nightly', '-y') }
+             Url = 'https://static.rust-lang.org/rustup/dist/aarch64-pc-windows-msvc/rustup-init.exe';
+             Args = @('--default-host', 'aarch64-pc-windows-msvc', '--default-toolchain', 'nightly', '-y') }
         )
         
         $deps | ForEach-Object {
-          $dep = $_
-          if ($dep.Url -match "^https?://") {
-            Log "Downloading $($dep.Name) from '$($dep.Url)'..."
-            $install_file = Join-Path "${{ github.workspace }}" (Split-Path $dep.Url -Leaf)
-            Invoke-WebRequest -Uri $dep.Url -OutFile $install_file
-          } elseif ($dep.Url -ne $null) {
-            Log "Using local files from '$($dep.Url)'..."
-            $install_file = $dep.Url
+          $install_file = $_.Url
+          if ($_.Url -match "^https?://") {
+            Log "Downloading $($_.Name) from '$($_.Url)'..."
+            $install_file = Join-Path "${{ github.workspace }}" (Split-Path $_.Url -Leaf)
+            Invoke-WebRequest -Uri $_.Url -OutFile $install_file
           }
 
-          if ($dep.Hash -ne $null) {
-            $expected_hash = if ($dep.Hash -like "*.sha256") {
-              $hash_file = Join-Path '${{ github.workspace }}' (Split-Path $dep.Hash -Leaf)
-              Invoke-WebRequest -Uri $dep.Hash -OutFile $hash_file
-              (Get-Content -Path $hash_file).Trim()
-            } else {
-              $dep.Hash
-            }
-
-            $downloaded_hash = (Get-FileHash -Path $install_file -Algorithm SHA256).Hash
-            if ($downloaded_hash -eq $expected_hash) {
-              Log "Hash verified successfully."
-            } else {
-              Log "Hash mismatch for $($dep.Name). Expected: $expected_hash, Got: $downloaded_hash" -Level "ERROR"
-            }
-          } else {
-            Log "No hash specified, skipping verification."
-          }
-
-          Log "Installing $($dep.Name)..."
-          Start-Process -FilePath $install_file -ArgumentList $dep.Args -NoNewWindow -Wait
-          Log "$($dep.Name) installation completed."
+          Log "Installing $($_.Name)..."
+          Start-Process -FilePath $install_file -ArgumentList $_.Args -NoNewWindow -Wait
+          Log "$($_.Name) installation completed."
         }
         
         $paths = @(
