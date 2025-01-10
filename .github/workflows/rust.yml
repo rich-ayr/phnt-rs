@@ -40,18 +40,6 @@ jobs:
     - name: Install Build Tools
       if: matrix.os == 'windows-11-preview_aarch64'
       run: |
-        Set-ExecutionPolicy Bypass -Scope Process -Force
-        [System.Net.ServicePointManager]::SecurityProtocol = [System.Net.ServicePointManager]::SecurityProtocol -bor 3072
-      
-        function Log { param([string]$Message, [string]$Level = "INFO")
-          $timestamp = Get-Date -Format 'yyyy-MM-dd HH:mm:ss'
-          if ($Level -eq "ERROR") {
-            Write-Host "$timestamp [ERROR] - $Message" -ForegroundColor Red
-          } else {
-            Write-Host "$timestamp [$Level] - $Message"
-          }
-        }
-
         $deps = @(
           @{ Name = 'Visual Studio 2022 Build Tools (aarch64)';
              Url = 'https://aka.ms/vs/17/release/vs_buildtools.exe';
@@ -68,26 +56,35 @@ jobs:
              Url = 'https://static.rust-lang.org/rustup/dist/aarch64-pc-windows-msvc/rustup-init.exe';
              Args = @('--default-host', 'aarch64-pc-windows-msvc', '--default-toolchain', 'nightly', '-y') }
         )
-        
-        $deps | ForEach-Object {
-          $install_file = $_.Url
-          if ($_.Url -match "^https?://") {
-            Log "Downloading $($_.Name) from '$($_.Url)'..."
-            $install_file = Join-Path "${{ github.workspace }}" (Split-Path $_.Url -Leaf)
-            Invoke-WebRequest -Uri $_.Url -OutFile $install_file
-          }
-
-          Log "Installing $($_.Name)..."
-          Start-Process -FilePath $install_file -ArgumentList $_.Args -NoNewWindow -Wait
-          Log "$($_.Name) installation completed."
-        }
-        
+   
         $paths = @(
           "$env:ProgramFiles\Git\cmd",       # Git
           "$env:ProgramFiles\Git\bin",       # Bash
           "$env:ProgramData\chocolatey\bin", # Chocolatey
           "$env:USERPROFILE\.cargo\bin"      # Rust
         )
+
+        function Log { param([string]$Message, [string]$Level = "INFO")
+          $timestamp = Get-Date -Format 'yyyy-MM-dd HH:mm:ss'
+          if ($Level -eq "ERROR") {
+            Write-Host "$timestamp [ERROR] - $Message" -ForegroundColor Red
+          } else {
+            Write-Host "$timestamp [$Level] - $Message"
+          }
+        }
+
+        $deps | ForEach-Object {
+          $install_file = $_.Url
+          if ($_.Url -match "^https?://") {
+            Log "Downloading $($_.Name) from '$($_.Url)'..."
+            $install_file = Join-Path "${{ github.workspace }}" (Split-Path $_.Url -Leaf)
+            Invoke-WebRequest -Uri $_.Url -OutFile $install_file -UseBasicParsing
+          }
+
+          Log "Installing $($_.Name)..."
+          Start-Process -FilePath $install_file -ArgumentList $_.Args -NoNewWindow -Wait
+          Log "$($_.Name) installation completed."
+        }
 
         $paths | ForEach-Object  {
           Add-Content -Path $env:GITHUB_PATH -Value "$($_)" -Encoding utf8
