@@ -58,10 +58,9 @@ jobs:
         )
    
         $paths = @(
-          "$env:ProgramFiles\\Git\\cmd",       # Git
-          "$env:ProgramFiles\\Git\\bin",       # Bash
-          "$env:ProgramData\\chocolatey\\bin", # Chocolatey
-          "$env:USERPROFILE\\.cargo\\bin"      # Rust
+          "$env:USERPROFILE\\.cargo\\bin", # Rust
+          "$env:ProgramFiles\\Git\\cmd",   # Git
+          "$env:ProgramFiles\\Git\\bin",   # Bash
         )
 
         function Log { param([string]$Message, [string]$Level = "INFO")
