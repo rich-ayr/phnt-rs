@@ -58,10 +58,10 @@ jobs:
         )
    
         $paths = @(
-          "$env:ProgramFiles\Git\cmd",       # Git
-          "$env:ProgramFiles\Git\bin",       # Bash
-          "$env:ProgramData\chocolatey\bin", # Chocolatey
-          "$env:USERPROFILE\.cargo\bin"      # Rust
+          "$env:ProgramFiles\\Git\\cmd",       # Git
+          "$env:ProgramFiles\\Git\\bin",       # Bash
+          "$env:ProgramData\\chocolatey\\bin", # Chocolatey
+          "$env:USERPROFILE\\.cargo\\bin"      # Rust
         )
 
         function Log { param([string]$Message, [string]$Level = "INFO")
@@ -109,7 +109,7 @@ jobs:
         PHNT_MODE: PHNT_MODE_USER
       run: |
         cargo test --release -vv -F regenerate --target ${{ matrix.target }}
-        
+
     - name: Extract architecture from target triple and move bindings
       run: |
         $arch = '${{ matrix.target }}' -split '-' | Select-Object -First 1
@@ -125,7 +125,7 @@ jobs:
       with:
         name: ${{ env.ARCH }}_bindgen.rs
         path: src/ffi/${{ env.ARCH }}_bindgen.rs
-        
+
   commit-and-push:
     runs-on: ubuntu-latest
     needs: bindgen
@@ -133,7 +133,7 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
-        
+
       - name: Download generated files
         uses: actions/download-artifact@v4
         with:
