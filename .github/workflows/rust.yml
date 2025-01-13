@@ -60,7 +60,7 @@ jobs:
         $paths = @(
           "$env:USERPROFILE\\.cargo\\bin", # Rust
           "$env:ProgramFiles\\Git\\cmd",   # Git
-          "$env:ProgramFiles\\Git\\bin",   # Bash
+          "$env:ProgramFiles\\Git\\bin"    # Bash
         )
 
         function Log { param([string]$Message, [string]$Level = "INFO")
