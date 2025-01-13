@@ -1,8 +1,6 @@
-
 /// A `cty` implementation that always assumes `target_os = "windows"`.
 /// Forked from `::core::ffi`
 pub type c_void = ::core::ffi::c_void;
-
 
 pub type c_char = i8; // Windows specific
 pub type c_schar = i8;
