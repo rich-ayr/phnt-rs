@@ -37,11 +37,14 @@ fn main() {
 #[cfg(feature = "regenerate")]
 mod regen {
    use regex::Regex;
-   use std::collections::HashMap;
+use syn::token::{Enum, Struct};
+   use std::collections::{HashMap};
    use std::env;
    use std::path::PathBuf;
 
-   use bindgen::callbacks::ParseCallbacks;
+   use bindgen::callbacks::{FunctionKind, ParseCallbacks};
+   use bindgen::callbacks::AttributeItemKind as AttrKind;
+   use rustc_hash::FxHashSet as HashSet;
 
    #[derive(Debug)]
    struct ProcessComments;
@@ -53,6 +56,35 @@ mod regen {
             Err(err) => {
                println!("cargo:warning=Problem processing doxygen comment: {comment}\n{err}");
                None
+            }
+         }
+      }
+      
+      fn process_attributes(&self, info: &bindgen::callbacks::AttributeInfo<'_>, attrs: &mut HashSet<String>) {
+         let kind_str = match info.kind {
+            AttrKind::Struct => { "struct" },
+            AttrKind::Enum => { "enum" },
+            AttrKind::Union => { "union" },
+            AttrKind::Function(_fn_kind) => { "fn" },
+            AttrKind::Var => { "var" }
+         };
+
+         println!("cargo:error={} - {}", info.name, kind_str);
+
+         match info.kind {
+            AttrKind::Var => {
+               
+            }
+            AttrKind::Struct | AttrKind::Union | AttrKind::Enum => {
+               attrs.insert(r#"#[cfg(feature="structs")]"#.to_owned());
+            }
+            AttrKind::Function(_) => {
+               attrs.insert(r#"#[cfg(feature="functions")]"#.to_owned());
+               attrs.insert(if info.name.starts_with("NtUser") {
+                  r#"#[link(name = "ntuser")]"#
+               } else {
+                  r#"#[link(name = "ntdll")]"#
+               }.to_owned());
             }
          }
       }
@@ -163,9 +195,7 @@ mod regen {
             .use_core()
             .ctypes_prefix("crate::cty")
             .parse_callbacks(Box::new(ProcessComments))
-            .default_enum_style(bindgen::EnumVariation::Rust {
-               non_exhaustive: true,
-            })
+            .default_enum_style(bindgen::EnumVariation::ModuleConsts)
             .default_alias_style(bindgen::AliasVariation::TypeAlias)
             .default_macro_constant_type(bindgen::MacroTypeVariation::Unsigned)
             .default_non_copy_union_style(bindgen::NonCopyUnionStyle::ManuallyDrop)
@@ -174,7 +204,8 @@ mod regen {
             .derive_default(true)
             .size_t_is_usize(true)
             .allowlist_recursively(true)
-            .merge_extern_blocks(true)
+            .merge_extern_blocks(false)
+            .merge_cfg_attributes(true)
             .generate_inline_functions(true)
             .vtable_generation(true)
             .generate_comments(true)

@@ -1,0 +1,39 @@
+[package]
+name = "phnt"
+version = "0.1.2"
+license = "MIT"
+authors = ["oberrich <oberrich.llvm@proton.me>"]
+repository = "https://github.com/delulusoft/phnt-rs"
+homepage = "https://github.com/delulusoft/phnt-rs"
+edition = "2024"
+build = "src/build.rs"
+description = "Rust bindings to the System Informer's (formerly known as Process Hacker) `phnt` native Windows headers"
+
+[features]
+regenerate = ["dep:regex", "dep:bindgen", "dep:chrono", "dep:doxygen-bindgen", "dep:rustc-hash"]
+
+[package.metadata.docs.rs]
+default-target = "x86_64-pc-windows-msvc"
+targets = ["x86_64-pc-windows-msvc"]
+rustdoc-args = ["--cfg", "docsrs"]
+rustc-args = ["--cfg", "docsrs"]
+
+[build-dependencies] # optional
+regex   = { version = "1.11.1", optional = true }
+rustc-hash = {version = "2.1.0", optional = true }
+bindgen = { path  = "C:/repos/rust-bindgen/bindgen", optional = true }
+chrono  = { version = "0.4.39", optional = true }
+doxygen-bindgen = { version = "0.1.2", optional = true }
+syn = {version = "2.0.96"}
+quote = "1.0.38"
+
+[dependencies.windows-sys]
+version = "0.59.0"
+features = ["Win32_Foundation"]
+
+[dev-dependencies.windows-sys]
+version = "0.59.0"
+features = ["Win32_System_Threading"]
+
+[dependencies]
+nt-string = "0.1.1"
