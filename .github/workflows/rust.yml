@@ -14,84 +14,18 @@ jobs:
         shell: powershell
     strategy:
       matrix:
-        os: [windows-11-preview_aarch64, windows-2025]
+        os: [windows-11-arm, windows-2025]
         target: [aarch64-pc-windows-msvc, x86_64-pc-windows-msvc, i686-pc-windows-msvc]
         exclude:
-          - os: windows-11-preview_aarch64
+          - os: windows-11-arm
             target: x86_64-pc-windows-msvc
-          - os: windows-11-preview_aarch64
+          - os: windows-11-arm
             target: i686-pc-windows-msvc
           - os: windows-2025
             target: aarch64-pc-windows-msvc
     runs-on: ${{ matrix.os }}
     steps:
-    - if: matrix.os == 'windows-11-preview_aarch64'
-      uses: robinraju/release-downloader@v1
-      with:
-        repository: 'llvm/llvm-project'
-        tag: 'llvmorg-19.1.5'
-        filename: 'LLVM-19.1.5-woa64.exe'
-    - if: matrix.os == 'windows-11-preview_aarch64'
-      uses: robinraju/release-downloader@v1
-      with:
-        repository: 'git-for-windows/git'
-        tag: 'v2.48.0-rc2.windows.1'
-        filename: 'Git-2.48.0-rc2-arm64.exe'
-    - name: Install Build Tools
-      if: matrix.os == 'windows-11-preview_aarch64'
-      run: |
-        $deps = @(
-          @{ Name = 'Visual Studio 2022 Build Tools (aarch64)';
-             Url = 'https://aka.ms/vs/17/release/vs_buildtools.exe';
-             Args = @('--add', 'Microsoft.VisualStudio.Component.VC.Tools.ARM64',
-                      '--add', 'Microsoft.VisualStudio.Component.Windows11SDK.22621',
-                      '--quiet', '--wait', '--norestart', '--nocache') },
-          @{ Name = 'Git 2.48.0-rc1';
-             Url = "${{github.workspace}}/Git-2.48.0-rc2-arm64.exe";
-             Args = @('/VERYSILENT', '/GitAndUnixToolsOnPath', '/NoAutoCrlf') },
-          @{ Name = 'LLVM 19.1.5';
-             Url = "${{github.workspace}}/LLVM-19.1.5-woa64.exe";
-             Args = @('/S') },
-          @{ Name = 'Rust (nightly, aarch64)';
-             Url = 'https://static.rust-lang.org/rustup/dist/aarch64-pc-windows-msvc/rustup-init.exe';
-             Args = @('--default-host', 'aarch64-pc-windows-msvc', '--default-toolchain', 'nightly', '-y') }
-        )
-   
-        $paths = @(
-          "$env:USERPROFILE\\.cargo\\bin", # Rust
-          "$env:ProgramFiles\\Git\\cmd",   # Git
-          "$env:ProgramFiles\\Git\\bin"    # Bash
-        )
-
-        function Log { param([string]$Message, [string]$Level = "INFO")
-          $timestamp = Get-Date -Format 'yyyy-MM-dd HH:mm:ss'
-          if ($Level -eq "ERROR") {
-            Write-Host "$timestamp [ERROR] - $Message" -ForegroundColor Red
-          } else {
-            Write-Host "$timestamp [$Level] - $Message"
-          }
-        }
-
-        $deps | ForEach-Object {
-          $install_file = $_.Url
-          if ($_.Url -match "^https?://") {
-            Log "Downloading $($_.Name) from '$($_.Url)'..."
-            $install_file = Join-Path "${{ github.workspace }}" (Split-Path $_.Url -Leaf)
-            Invoke-WebRequest -Uri $_.Url -OutFile $install_file -UseBasicParsing
-          }
-
-          Log "Installing $($_.Name)..."
-          Start-Process -FilePath $install_file -ArgumentList $_.Args -NoNewWindow -Wait
-          Log "$($_.Name) installation completed."
-        }
-
-        $paths | ForEach-Object  {
-          Add-Content -Path $env:GITHUB_PATH -Value "$($_)" -Encoding utf8
-          Log "Added $_ to `$GITHUB_PATH"
-        }
-
     - name: Install Rust
-      if: matrix.os != 'windows-11-preview_aarch64'
       uses: dtolnay/rust-toolchain@nightly
       with:
         targets: ${{ matrix.target }}
