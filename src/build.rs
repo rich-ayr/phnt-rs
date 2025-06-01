@@ -104,6 +104,13 @@ mod regen {
             regex::escape(env!("CARGO_MANIFEST_DIR"))
          ))
          .unwrap();
+         
+         let blocklist_ty_regexpr = Regex::new(&format!(
+             r"({}\\deps\\phnt-nightly\\ntzwapi.h)",
+             regex::escape(env!("CARGO_MANIFEST_DIR"))
+         ))
+         .unwrap();
+         
 
          let blocklist_regexpr =
             Regex::new(&format!(r"({})", self.blocklist_types.join("|"))).unwrap();
@@ -150,7 +157,8 @@ mod regen {
             .raw_line(raw_lines.join("\r\n").as_str())
             .clang_args(clang_args)
             .allowlist_file(allowlist_regexpr.as_str())
-            .blocklist_type(blocklist_regexpr.as_str())
+            .blocklist_file(blocklist_regexpr.as_str())
+            .blocklist_type(blocklist_ty_regexpr.as_str())
             .type_alias("NTSTATUS")
             .opaque_type("std::.*")
             .use_core()
