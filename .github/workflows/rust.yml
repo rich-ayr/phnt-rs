@@ -14,7 +14,7 @@ jobs:
         shell: powershell
     strategy:
       matrix:
-        os: [windows-11-arm, windows-2025]
+        os: [windows-2025]
         target: [aarch64-pc-windows-msvc, x86_64-pc-windows-msvc, i686-pc-windows-msvc]
         exclude:
           - os: windows-11-arm
