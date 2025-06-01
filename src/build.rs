@@ -105,14 +105,14 @@ mod regen {
          ))
          .unwrap();
          
-         let blocklist_ty_regexpr = Regex::new(&format!(
-             r"({}\\deps\\phnt-nightly\\ntzwapi.h)",
+         let blocklist_regexpr = Regex::new(&format!(
+             r"({}\\deps\\phnt-nightly\\ntzwapi\.h)",
              regex::escape(env!("CARGO_MANIFEST_DIR"))
          ))
          .unwrap();
          
 
-         let blocklist_regexpr =
+         let blocklist_ty_regexpr =
             Regex::new(&format!(r"({})", self.blocklist_types.join("|"))).unwrap();
 
          let mut raw_lines = vec![
