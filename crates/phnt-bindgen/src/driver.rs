@@ -126,17 +126,22 @@ impl Driver {
         Ok(path)
     }
 
-    /// The clang argv for a cell's JSON AST dump over `wrapper`. Mirrors the
-    /// validated M0 invocation. `PHNT_MODE` is set explicitly for *both* surfaces
-    /// so config is driver-owned (safe: phnt.h guards it with `#ifndef`); kernel
-    /// cells add the two-signal kernel switch (spec §4c).
-    pub fn ast_argv(&self, cell: &Cell, wrapper: &Path) -> Vec<OsString> {
+    /// The clang argv for `wrapper`, with `frontend` selecting the dump mode
+    /// (`-ast-dump=json` vs `-fdump-record-layouts-complete`, both `-fsyntax-only`).
+    /// Everything after the frontend flags is identical across modes — the same
+    /// target, MS compat, `PHNT_VERSION`/`PHNT_MODE` config, and include path — so
+    /// a layout dump measures the *exact* TU the AST was parsed from.
+    ///
+    /// `PHNT_MODE` is set explicitly for *both* surfaces so config is driver-owned
+    /// (safe: phnt.h guards it with `#ifndef`); kernel cells add the two-signal
+    /// kernel switch (spec §4c).
+    fn cc_argv(&self, cell: &Cell, wrapper: &Path, frontend: &[&str]) -> Vec<OsString> {
         let mut argv: Vec<OsString> = Vec::new();
         let mut push = |s: &str| argv.push(OsString::from(s));
 
-        push("-Xclang");
-        push("-ast-dump=json");
-        push("-fsyntax-only");
+        for f in frontend {
+            push(f);
+        }
 
         push(&format!("--target={}", cell.arch.triple()));
         push("-fms-compatibility");
@@ -162,11 +167,33 @@ impl Driver {
         argv
     }
 
+    /// The clang argv for a cell's JSON AST dump over `wrapper`. Mirrors the
+    /// validated M0 invocation.
+    pub fn ast_argv(&self, cell: &Cell, wrapper: &Path) -> Vec<OsString> {
+        self.cc_argv(cell, wrapper, &["-Xclang", "-ast-dump=json", "-fsyntax-only"])
+    }
+
+    /// The clang argv for a cell's record-layout dump over `wrapper`. Uses the
+    /// `-complete` variant so *every* complete record is dumped (not only those
+    /// codegen happens to touch) — the layout ground truth for [`crate::verify`].
+    pub fn layout_argv(&self, cell: &Cell, wrapper: &Path) -> Vec<OsString> {
+        self.cc_argv(cell, wrapper, &["-Xclang", "-fdump-record-layouts-complete", "-fsyntax-only"])
+    }
+
     /// A copy-pasteable shell rendering of the AST invocation, for reproducibility
     /// (M0 deliverable: "a reproducible driver invocation").
     pub fn ast_cmdline(&self, cell: &Cell, wrapper: &Path) -> String {
-        let mut parts = vec![self.clang.display().to_string()];
-        for a in self.ast_argv(cell, wrapper) {
+        Self::render_cmdline(&self.clang, self.ast_argv(cell, wrapper))
+    }
+
+    /// A copy-pasteable shell rendering of the record-layout invocation.
+    pub fn layout_cmdline(&self, cell: &Cell, wrapper: &Path) -> String {
+        Self::render_cmdline(&self.clang, self.layout_argv(cell, wrapper))
+    }
+
+    fn render_cmdline(clang: &Path, argv: Vec<OsString>) -> String {
+        let mut parts = vec![clang.display().to_string()];
+        for a in argv {
             parts.push(a.to_string_lossy().into_owned());
         }
         parts.join(" ")
@@ -177,18 +204,30 @@ impl Driver {
     /// rather than buffering it in memory. Clang warnings go to `out_json`'s
     /// sibling `.stderr.txt`; a non-zero exit is a hard error.
     pub fn capture_ast(&self, cell: &Cell, wrapper: &Path, out_json: &Path) -> Result<()> {
-        if let Some(parent) = out_json.parent() {
+        self.run_to_file(cell, self.ast_argv(cell, wrapper), out_json)
+    }
+
+    /// Run clang for `cell` and stream its record-layout dump to `out_txt` (a few
+    /// MB for the full surface). Same redirection/error contract as [`capture_ast`].
+    pub fn capture_layouts(&self, cell: &Cell, wrapper: &Path, out_txt: &Path) -> Result<()> {
+        self.run_to_file(cell, self.layout_argv(cell, wrapper), out_txt)
+    }
+
+    /// Spawn clang with `argv`, redirecting stdout to `out` and stderr (clang's
+    /// warnings) to `out`'s sibling `.stderr.txt`. A non-zero exit is a hard error.
+    fn run_to_file(&self, cell: &Cell, argv: Vec<OsString>, out: &Path) -> Result<()> {
+        if let Some(parent) = out.parent() {
             std::fs::create_dir_all(parent).ok();
         }
-        let out = File::create(out_json)
-            .with_context(|| format!("creating AST output file {}", out_json.display()))?;
-        let err_path = out_json.with_extension("stderr.txt");
+        let out_file = File::create(out)
+            .with_context(|| format!("creating output file {}", out.display()))?;
+        let err_path = out.with_extension("stderr.txt");
         let err = File::create(&err_path)
             .with_context(|| format!("creating stderr file {}", err_path.display()))?;
 
         let status = Command::new(&self.clang)
-            .args(self.ast_argv(cell, wrapper))
-            .stdout(out)
+            .args(argv)
+            .stdout(out_file)
             .stderr(err)
             .status()
             .with_context(|| format!("failed to spawn clang ({})", self.clang.display()))?;

@@ -33,7 +33,9 @@ pub enum CType {
     /// (`file:line:col`). `universe` rewrites these into [`CType::Named`] with a
     /// deterministic synthetic name before emission.
     Anon(String),
-    Pointer { konst: bool, inner: Box<CType> },
+    /// `ptr32` marks an MSVC `__ptr32` pointer — **4 bytes** in 64-bit code
+    /// (WoW64 thunk structs), emitted as a `u32` so its size/alignment is faithful.
+    Pointer { konst: bool, ptr32: bool, inner: Box<CType> },
     Array { len: usize, inner: Box<CType> },
     FnPtr(FnPtr),
     /// A form the parser did not recognize (retained verbatim for diagnostics).
@@ -165,19 +167,19 @@ fn parse_inner_cc(s: &str, cc: FnCc) -> CType {
 
     // Trailing pointer(s). The rightmost `*` is the outermost pointer. The tail
     // after it may hold only pointer qualifiers (`const`, MSVC `__ptr32`/
-    // `__ptr64`/`__unaligned`). NOTE: `__ptr32` is a 4-byte pointer in 64-bit
-    // code (WoW64 structs) — we emit a normal pointer for now; the layout-verify
-    // step will flag any WoW64 size mismatch (TODO).
+    // `__ptr64`/`__unaligned`). `__ptr32` makes the *outermost* pointer 4 bytes
+    // (WoW64) — recorded so emit renders it as `u32` (see [`CType::Pointer`]).
     if let Some(star) = s.rfind('*') {
         let tail = s[star + 1..].trim();
         if tail.split_whitespace().all(is_ptr_qualifier) {
+            let ptr32 = tail.split_whitespace().any(|w| w == "__ptr32");
             let head = s[..star].trim();
             // Pointee const-ness: east-const (`T const *`) or west-const
             // (`const T *`). Const vs mut is ABI-identical — this is cosmetic,
             // matched to bindgen's choice for the common single-level case.
             let konst = pointee_is_const(head);
             let inner = parse_inner(head);
-            return CType::Pointer { konst, inner: Box::new(inner) };
+            return CType::Pointer { konst, ptr32, inner: Box::new(inner) };
         }
     }
 
@@ -513,7 +515,10 @@ impl CType {
                 quote!(#id)
             }
             CType::Anon(_) | CType::Unknown(_) => quote!(*mut ::core::ffi::c_void),
-            CType::Pointer { konst, inner } => {
+            // A `__ptr32` pointer is a 4-byte WoW64 pointer; emit `u32` for a
+            // faithful size/alignment (it is not natively dereferenceable on x64).
+            CType::Pointer { ptr32: true, .. } => quote!(u32),
+            CType::Pointer { konst, inner, ptr32: false } => {
                 let it = inner.to_rust_ptr_target();
                 if *konst {
                     quote!(*const #it)
@@ -538,25 +543,40 @@ impl CType {
 }
 
 impl Prim {
+    /// Render to a **concrete** Rust integer/float type with the Windows/LLP64
+    /// meaning baked in — deliberately NOT `::core::ffi::c_*`.
+    ///
+    /// `::core::ffi`'s widths and signedness track the *host* target, not Windows:
+    /// `c_char` is unsigned on aarch64 (Windows `char` is signed → `i8`), and
+    /// `c_long`/`c_ulong` are 64-bit on any LP64 target (Windows LLP64 keeps them
+    /// 32-bit). These bindings describe the Windows ABI, so a build for aarch64 or
+    /// a non-Windows host (docs/CI) must not let `::core::ffi` reinterpret them —
+    /// that would silently corrupt signedness and field widths. The `phnt` crate's
+    /// forked `cty` module pins exactly these types; emitting the pinned concrete
+    /// type directly gives the same guarantee with no dependency and keeps the
+    /// generated `ffi` self-contained (so it still compiles standalone).
+    ///
+    /// `void` and opaque pointees stay `::core::ffi::c_void` (its one non-numeric
+    /// case, which `cty::c_void` also just re-exports).
     pub fn to_rust(&self) -> TokenStream {
         use Prim::*;
         match self {
-            Char => quote!(::core::ffi::c_char),
-            SChar => quote!(::core::ffi::c_schar),
-            UChar => quote!(::core::ffi::c_uchar),
-            Short => quote!(::core::ffi::c_short),
-            UShort => quote!(::core::ffi::c_ushort),
-            Int => quote!(::core::ffi::c_int),
-            UInt => quote!(::core::ffi::c_uint),
-            Long => quote!(::core::ffi::c_long),
-            ULong => quote!(::core::ffi::c_ulong),
-            LongLong => quote!(::core::ffi::c_longlong),
-            ULongLong => quote!(::core::ffi::c_ulonglong),
+            Char => quote!(i8), // MSVC `char` is signed
+            SChar => quote!(i8),
+            UChar => quote!(u8),
+            Short => quote!(i16),
+            UShort => quote!(u16),
+            Int => quote!(i32),
+            UInt => quote!(u32),
+            Long => quote!(i32),  // LLP64: `long` is 32-bit
+            ULong => quote!(u32), // LLP64: `unsigned long` is 32-bit
+            LongLong => quote!(i64),
+            ULongLong => quote!(u64),
             Int64 => quote!(i64),
             UInt64 => quote!(u64),
             Float => quote!(f32),
             Double => quote!(f64),
-            WcharT => quote!(u16),
+            WcharT => quote!(u16), // Windows `wchar_t` is 16-bit
         }
     }
 }
@@ -639,20 +659,36 @@ mod tests {
     fn pointers() {
         assert_eq!(
             p("struct _UNICODE_STRING *"),
-            CType::Pointer { konst: false, inner: Box::new(CType::Named("_UNICODE_STRING".into())) }
+            CType::Pointer {
+                konst: false,
+                ptr32: false,
+                inner: Box::new(CType::Named("_UNICODE_STRING".into())),
+            }
         );
         assert_eq!(
             p("const wchar_t *"),
-            CType::Pointer { konst: true, inner: Box::new(CType::Prim(Prim::WcharT)) }
+            CType::Pointer { konst: true, ptr32: false, inner: Box::new(CType::Prim(Prim::WcharT)) }
         );
         // Double pointer.
         assert_eq!(
             p("void **"),
             CType::Pointer {
                 konst: false,
-                inner: Box::new(CType::Pointer { konst: false, inner: Box::new(CType::Void) })
+                ptr32: false,
+                inner: Box::new(CType::Pointer {
+                    konst: false,
+                    ptr32: false,
+                    inner: Box::new(CType::Void),
+                }),
             }
         );
+        // `__ptr32` — a 4-byte WoW64 pointer, rendered as `u32`.
+        let p32 = p("void * __ptr32");
+        assert_eq!(
+            p32,
+            CType::Pointer { konst: false, ptr32: true, inner: Box::new(CType::Void) }
+        );
+        assert_eq!(p32.to_rust().to_string(), "u32");
     }
 
     #[test]
@@ -684,7 +720,7 @@ mod tests {
         // Anon with pointer decoration.
         assert_eq!(
             p("struct (unnamed at f.h:1:2) *"),
-            CType::Pointer { konst: false, inner: Box::new(CType::Anon("f.h:1:2".into())) }
+            CType::Pointer { konst: false, ptr32: false, inner: Box::new(CType::Anon("f.h:1:2".into())) }
         );
     }
 

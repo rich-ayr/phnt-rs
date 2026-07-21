@@ -36,9 +36,33 @@ struct Closure {
 }
 
 /// Emit a formatted, self-contained Rust `ffi` source string for `m`.
-pub fn emit(m: &Module, idx: &Index) -> Result<String> {
+///
+/// When `layouts` is `Some`, a `#[cfg(test)] mod _layout_checks` of compile-time
+/// `size_of`/`align_of`/`offset_of` assertions against clang's record-layout dump
+/// is appended (spec §8 check #2); the coverage stats are logged to stderr.
+pub fn emit(
+    m: &Module,
+    idx: &Index,
+    layouts: Option<&crate::verify::LayoutMap>,
+    append_checks: bool,
+    ptr_bytes: u64,
+) -> Result<String> {
     let closure = compute_closure(m, idx);
-    let tokens = generate(m, &closure);
+    let mut tokens = generate(m, &closure, layouts, ptr_bytes);
+    if let (Some(layouts), true) = (layouts, append_checks) {
+        let (checks, stats) = crate::verify::emit_layout_checks(&closure.records, layouts);
+        eprintln!(
+            "[phnt-bindgen] layout parity: {} records matched, {} unmatched (anon-typedef/opaque), \
+             {} hoisted-anon skipped, {} known-divergent; {} size+align, {} offset asserts",
+            stats.matched,
+            stats.unmatched,
+            stats.anon_skipped,
+            stats.known_divergent,
+            stats.size_checks,
+            stats.offset_checks,
+        );
+        tokens = quote! { #tokens #checks };
+    }
     let file = syn::parse2::<syn::File>(tokens).context("emitted tokens are not valid Rust")?;
     Ok(prettyplease::unparse(&file))
 }
@@ -203,8 +227,34 @@ fn compute_closure(m: &Module, idx: &Index) -> Closure {
 // Generate
 // ---------------------------------------------------------------------------
 
-fn generate(m: &Module, c: &Closure) -> TokenStream {
-    let records = c.records.values().map(|r| emit_record(r, &c.typedefs));
+fn generate(
+    m: &Module,
+    c: &Closure,
+    layouts: Option<&crate::verify::LayoutMap>,
+    ptr_bytes: u64,
+) -> TokenStream {
+    // A name→alignment table for records (clang-measured) and enums (repr width),
+    // used to decide each record's `#[repr]` (plain / `align(N)` / `packed(N)`).
+    let empty = crate::verify::LayoutMap::new();
+    let layouts = layouts.unwrap_or(&empty);
+    let enum_align: BTreeMap<String, u64> = c
+        .enums
+        .values()
+        .filter_map(|e| e.name.clone().map(|n| (n, prim_size(enum_repr_of(e)) as u64)))
+        .collect();
+
+    let cx = AlignCtx {
+        layouts,
+        records: &c.records,
+        enum_align: &enum_align,
+        typedefs: &c.typedefs,
+        ptr_bytes,
+    };
+    let reprs = compute_reprs(&c.records, &cx);
+    let records = c
+        .records
+        .values()
+        .map(|r| emit_record(r, reprs[r.name.as_deref().unwrap_or("_anon")], &cx));
     let enums = c.enums.values().map(emit_enum);
     let typedefs = c.typedefs.values().filter_map(emit_typedef);
     let opaque = c.opaque.iter().map(|n| emit_opaque(n));
@@ -230,21 +280,313 @@ fn ident(name: &str) -> proc_macro2::Ident {
 
 // --- records ---------------------------------------------------------------
 
-fn emit_record(r: &Record, typedefs: &BTreeMap<String, Typedef>) -> TokenStream {
-    let name = ident(r.name.as_deref().unwrap_or("_anon"));
-    let body = emit_fields(&r.fields, typedefs);
+/// How a record's `#[repr(...)]` must deviate from plain `#[repr(C)]` to match
+/// clang's measured layout (packed / over-aligned; see [`record_repr`]).
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+enum Repr {
+    /// Natural C layout — rustc's `#[repr(C)]` already matches clang.
+    C,
+    /// `__declspec(align(N))` / over-aligned: raise the struct alignment to `N`.
+    Align(u64),
+    /// `#pragma pack(N)`: cap field alignment at `N` (tighter offsets, no padding).
+    Packed(u64),
+}
+
+impl Repr {
+    fn attr(self) -> TokenStream {
+        match self {
+            Repr::C => quote! { #[repr(C)] },
+            Repr::Align(n) => {
+                let n = proc_macro2::Literal::u64_unsuffixed(n);
+                quote! { #[repr(C, align(#n))] }
+            }
+            // `packed` and `packed(1)` are equivalent; prefer the shorter form.
+            Repr::Packed(1) => quote! { #[repr(C, packed)] },
+            Repr::Packed(n) => {
+                let n = proc_macro2::Literal::u64_unsuffixed(n);
+                quote! { #[repr(C, packed(#n))] }
+            }
+        }
+    }
+}
+
+fn emit_record(r: &Record, repr: Repr, cx: &AlignCtx) -> TokenStream {
+    let name_str = r.name.as_deref().unwrap_or("_anon");
+    let name = ident(name_str);
+    // Structs with per-field over-alignment (e.g. `DECLSPEC_CACHEALIGN`) need
+    // explicit padding to reach clang's offsets — Rust can't align a single field.
+    // For everything else this returns `None` and we emit fields verbatim.
+    let body = cx
+        .layouts
+        .get(name_str)
+        .filter(|_| !r.is_union)
+        .and_then(|l| synth_padded_fields(r, l, cx))
+        .unwrap_or_else(|| emit_fields(&r.fields, cx.typedefs));
+    let attr = repr.attr();
     if r.is_union {
         quote! {
-            #[repr(C)]
+            #attr
             #[derive(Copy, Clone)]
             pub union #name { #body }
         }
     } else {
         quote! {
-            #[repr(C)]
+            #attr
             #[derive(Copy, Clone)]
             pub struct #name { #body }
         }
+    }
+}
+
+/// Bundle of the closure tables an alignment query needs to resolve a name, plus
+/// the target's pointer width (bytes) — the one arch-dependent quantity in the
+/// size/alignment model (4 on x86, 8 on x86_64/aarch64). A native pointer's Rust
+/// size *and* alignment both equal this; `__ptr32` is always 4.
+struct AlignCtx<'a> {
+    layouts: &'a crate::verify::LayoutMap,
+    records: &'a BTreeMap<String, Record>,
+    enum_align: &'a BTreeMap<String, u64>,
+    typedefs: &'a BTreeMap<String, Typedef>,
+    ptr_bytes: u64,
+}
+
+/// The Rust alignment a field type contributes, i.e. the alignment of that type
+/// **as we emit it**. Records get clang's measured alignment when known
+/// (`layouts`), otherwise their natural alignment computed recursively (hoisted
+/// anon members live only in the closure, never in the dump); enums use their
+/// repr width; unresolved names emit as opaque `[u8; 0]`, whose alignment is 1.
+///
+/// Because we always emit `packed(clang.align)` for a packed record — provably
+/// equivalent to the original `#pragma pack` for *any* field set — this value only
+/// needs to be accurate enough to separate the packed case (`clang.align < nat`)
+/// from the over-aligned case (`clang.align > nat`).
+fn field_align(ty: &CType, cx: &AlignCtx, depth: u32) -> u64 {
+    if depth > 32 {
+        return cx.ptr_bytes; // defensive: cap pathological recursion
+    }
+    match ty {
+        CType::Prim(p) => prim_size(*p) as u64, // scalars self-align on win64
+        CType::Bool => 1,
+        CType::Pointer { ptr32: true, .. } => 4, // WoW64 4-byte pointer ⇒ `u32`
+        CType::Pointer { .. } | CType::FnPtr(_) => cx.ptr_bytes,
+        CType::Array { inner, .. } => field_align(inner, cx, depth + 1),
+        CType::Named(n) => {
+            if let Some(rl) = cx.layouts.get(n) {
+                return rl.align.max(1);
+            }
+            if let Some(a) = cx.enum_align.get(n) {
+                return *a;
+            }
+            if let Some(p) = well_known_prim(n) {
+                return prim_size(p) as u64;
+            }
+            if let Some(r) = cx.records.get(n) {
+                return natural_align(r, cx, depth + 1);
+            }
+            if let Some(td) = cx.typedefs.get(n) {
+                return field_align(&td.ty, cx, depth + 1);
+            }
+            1 // opaque / unresolved ⇒ emitted as `[u8; 0]`
+        }
+        CType::Void | CType::Anon(_) | CType::Unknown(_) => 1,
+    }
+}
+
+/// The size in bytes a field type occupies, resolved the same way as
+/// [`field_align`] but using clang's measured record *sizes*. `None` if any leaf
+/// can't be sized exactly (opaque, anon-not-in-dump, unknown) — the caller then
+/// declines to synthesize padding for that record rather than risk a wrong offset.
+fn field_size(ty: &CType, cx: &AlignCtx, depth: u32) -> Option<u64> {
+    if depth > 32 {
+        return None;
+    }
+    Some(match ty {
+        CType::Prim(p) => prim_size(*p) as u64,
+        CType::Bool => 1,
+        CType::Pointer { ptr32: true, .. } => 4, // WoW64 `u32`
+        CType::Pointer { .. } | CType::FnPtr(_) => cx.ptr_bytes,
+        CType::Array { len, inner } => (*len as u64).checked_mul(field_size(inner, cx, depth + 1)?)?,
+        CType::Named(n) => {
+            if let Some(rl) = cx.layouts.get(n) {
+                rl.size
+            } else if let Some(a) = cx.enum_align.get(n) {
+                *a // an enum's size == its repr width (== its alignment)
+            } else if let Some(p) = well_known_prim(n) {
+                prim_size(p) as u64
+            } else {
+                // Follow a typedef alias; `?` bails (unsizeable: opaque /
+                // hoisted-anon record not present in the dump).
+                field_size(&cx.typedefs.get(n)?.ty, cx, depth + 1)?
+            }
+        }
+        CType::Void | CType::Anon(_) | CType::Unknown(_) => return None,
+    })
+}
+
+fn round_up(pos: u64, align: u64) -> u64 {
+    pos.div_ceil(align.max(1)) * align.max(1)
+}
+
+/// Reproduce clang's layout for a record with per-*field* over-alignment (e.g.
+/// `DECLSPEC_CACHEALIGN`, which forces a field to a cache-line boundary) by
+/// inserting explicit `[u8; N]` padding — Rust cannot align an individual struct
+/// field. Padding is emitted **only** where clang's field offset exceeds the
+/// natural offset rustc would already produce (`off > round_up(pos, field_align)`);
+/// a purely naturally-aligned struct therefore triggers nothing and is emitted
+/// verbatim (returns `None`), leaving the other ~2300 records byte-identical.
+///
+/// The struct's own `#[repr(C, align(N))]` (chosen by [`record_repr`] from the
+/// same over-alignment) supplies the final alignment and tail rounding; this only
+/// fixes the *inter-field* offsets. Declines (`None`) for unions, bitfield members,
+/// unnamed/undumped fields, or any field it can't size exactly.
+fn synth_padded_fields(
+    r: &Record,
+    layout: &crate::verify::RecordLayout,
+    cx: &AlignCtx,
+) -> Option<TokenStream> {
+    let mut items: Vec<TokenStream> = Vec::new();
+    let mut pos: u64 = 0;
+    let mut pad_ctr = 0usize;
+    let mut needs = false;
+
+    let pad = |items: &mut Vec<TokenStream>, ctr: &mut usize, bytes: u64| {
+        *ctr += 1;
+        let pn = format_ident!("__pad_{}", *ctr);
+        let n = bytes as usize;
+        items.push(quote! { pub #pn: [u8; #n] });
+    };
+
+    for f in &r.fields {
+        if f.bitfield_width.is_some() {
+            return None; // bitfield offset model is out of scope here
+        }
+        let name = f.name.as_deref()?;
+        let &off = layout.fields.get(name)?;
+        let size = field_size(&f.ty, cx, 0)?;
+        let align = field_align(&f.ty, cx, 0);
+        if off < round_up(pos, align) {
+            return None; // clang placed it *below* the natural offset — inconsistent
+        }
+        if off > round_up(pos, align) {
+            // Over-aligned: fill everything up to `off` explicitly (it is already
+            // `align`-aligned, so rustc adds no padding of its own before the field).
+            pad(&mut items, &mut pad_ctr, off - pos);
+            needs = true;
+        }
+        let fname = ident(name);
+        let ty = f.ty.to_rust();
+        items.push(quote! { pub #fname: #ty });
+        pos = off + size;
+    }
+
+    if !needs {
+        return None; // no super-natural gap ⇒ let the verbatim path handle it
+    }
+    if layout.size > pos {
+        pad(&mut items, &mut pad_ctr, layout.size - pos);
+    }
+    Some(quote! { #(#items),* })
+}
+
+/// The natural (unpacked) alignment of a record: the max alignment of its fields.
+/// A bitfield contributes its base integer type's alignment.
+fn natural_align(r: &Record, cx: &AlignCtx, depth: u32) -> u64 {
+    let mut nat: u64 = 1;
+    for f in &r.fields {
+        let fa = if f.bitfield_width.is_some() {
+            resolve_prim(&f.ty, cx.typedefs).map(|p| prim_size(p) as u64).unwrap_or(1)
+        } else {
+            field_align(&f.ty, cx, depth)
+        };
+        nat = nat.max(fa);
+    }
+    nat
+}
+
+/// Choose the `#[repr]` for `r` that reproduces clang's measured layout.
+///
+/// The AST does not carry the numeric `#pragma pack` / `__declspec(align)` value
+/// (verified: no `alignment` key in the JSON), so we derive it from the layout
+/// dump. Let `nat` be rustc's natural alignment (the max field alignment). clang's
+/// final alignment is `min(pack, nat)` for a packed record and `max(declspec, nat)`
+/// for an over-aligned one, so:
+/// - `clang.align > nat` ⇒ over-aligned ⇒ `align(clang.align)` (offsets unchanged);
+/// - `clang.align < nat` ⇒ packed ⇒ `packed(clang.align)` — capping field align at
+///   `clang.align` == `min(pack, nat)` yields exactly `pack`'s effect, since every
+///   field align is ≤ `nat`.
+///
+/// Records with no dump entry (anon / anon-typedef) keep plain `#[repr(C)]`; the
+/// parity assertions catch anything this misjudges.
+fn record_repr(r: &Record, cx: &AlignCtx) -> Repr {
+    let Some(rl) = r.name.as_deref().and_then(|n| cx.layouts.get(n)) else {
+        return Repr::C; // no ground truth (anon / anon-typedef) ⇒ keep natural
+    };
+    let ca = rl.align.max(1);
+    let nat = natural_align(r, cx, 0);
+    if ca > nat {
+        Repr::Align(ca)
+    } else if ca < nat {
+        Repr::Packed(ca)
+    } else {
+        Repr::C
+    }
+}
+
+/// Compute every record's `#[repr]`. A first pass sets each record from clang's
+/// measured layout ([`record_repr`]); hoisted-anon records have no dump entry so
+/// they start at `Repr::C`. A `#pragma pack` is lexically inherited by nested anon
+/// members, so a second pass propagates each packed record's `packed(N)` onto the
+/// hoisted-anon records it embeds *by value* — otherwise the anon keeps its natural
+/// internal padding and inflates the packed parent's size (e.g. `_AFD_ADDRESS`).
+/// The propagation runs to a fixpoint for anon-in-anon nesting, taking the tightest
+/// (smallest) `N` when an anon is reached from more than one parent.
+fn compute_reprs(records: &BTreeMap<String, Record>, cx: &AlignCtx) -> BTreeMap<String, Repr> {
+    let mut reprs: BTreeMap<String, Repr> = records
+        .iter()
+        .map(|(n, r)| (n.clone(), record_repr(r, cx)))
+        .collect();
+
+    loop {
+        let mut updates: Vec<(String, u64)> = Vec::new();
+        for (name, r) in records {
+            let Repr::Packed(n) = reprs[name] else { continue };
+            for f in &r.fields {
+                let mut anons = Vec::new();
+                anon_member_names(&f.ty, records, &mut anons);
+                for m in anons {
+                    updates.push((m, n));
+                }
+            }
+        }
+        let mut changed = false;
+        for (m, n) in updates {
+            let tighter = match reprs.get(&m) {
+                Some(Repr::Packed(k)) => n < *k,
+                _ => true,
+            };
+            if tighter {
+                reprs.insert(m, Repr::Packed(n));
+                changed = true;
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+    reprs
+}
+
+/// Names of the hoisted-anon records a type embeds **by value** (directly or
+/// through an array — a pointer/fnptr does not embed its target).
+fn anon_member_names(ty: &CType, records: &BTreeMap<String, Record>, out: &mut Vec<String>) {
+    match ty {
+        CType::Named(n) => {
+            if records.get(n).is_some_and(|r| r.anon) {
+                out.push(n.clone());
+            }
+        }
+        CType::Array { inner, .. } => anon_member_names(inner, records, out),
+        _ => {}
     }
 }
 
@@ -343,6 +685,15 @@ fn resolve_prim(ty: &CType, typedefs: &BTreeMap<String, Typedef>) -> Option<Prim
     None
 }
 
+/// The base integer `Prim` for a small set of **fixed-width** Windows integer
+/// typedefs, used to size bitfield storage units and field alignment when the
+/// typedef isn't otherwise resolvable.
+///
+/// Deliberately excludes the *pointer-sized* integers (`ULONG_PTR`, `LONG_PTR`,
+/// `SIZE_T`, `SSIZE_T`, `DWORD_PTR`, `INT_PTR`, `UINT_PTR`): those are 4 bytes on
+/// x86 and 8 on x64/arm64, so hardcoding them here mis-sized them on x86 (wrong
+/// bitfield storage width, wrong `#[repr]`). They resolve instead through the
+/// arch-specific typedef table (from that cell's AST), which is always correct.
 fn well_known_prim(n: &str) -> Option<Prim> {
     Some(match n {
         "ULONG" | "DWORD" | "UINT" | "ULONG32" | "DWORD32" => Prim::ULong,
@@ -351,9 +702,8 @@ fn well_known_prim(n: &str) -> Option<Prim> {
         "SHORT" | "INT16" => Prim::Short,
         "UCHAR" | "BYTE" | "BOOLEAN" | "UINT8" => Prim::UChar,
         "CHAR" | "CCHAR" | "INT8" => Prim::Char,
-        "ULONGLONG" | "ULONG64" | "DWORD64" | "DWORDLONG" | "UINT64" | "QWORD" | "SIZE_T"
-        | "ULONG_PTR" | "DWORD_PTR" => Prim::UInt64,
-        "LONGLONG" | "LONG64" | "INT64" | "LONG_PTR" | "SSIZE_T" => Prim::Int64,
+        "ULONGLONG" | "ULONG64" | "DWORD64" | "DWORDLONG" | "UINT64" | "QWORD" => Prim::UInt64,
+        "LONGLONG" | "LONG64" | "INT64" => Prim::Int64,
         _ => return None,
     })
 }
@@ -383,9 +733,8 @@ fn emit_typedef(t: &Typedef) -> Option<TokenStream> {
 
 // --- enums (constified) ----------------------------------------------------
 
-fn emit_enum(e: &Enum) -> TokenStream {
-    // Resolve constant values (implicit = previous + 1), then pick an underlying
-    // integer type that fits them (or the fixed underlying type if declared).
+/// Resolve an enum's constant values (implicit = previous + 1).
+fn resolve_enum_vals(e: &Enum) -> Vec<(String, i128)> {
     let mut vals: Vec<(String, i128)> = Vec::new();
     let mut next: i128 = 0;
     for k in &e.constants {
@@ -397,6 +746,18 @@ fn emit_enum(e: &Enum) -> TokenStream {
         vals.push((k.name.clone(), v));
         next = v + 1;
     }
+    vals
+}
+
+/// The integer `Prim` an enum is constified to (its Rust alignment == its size).
+fn enum_repr_of(e: &Enum) -> Prim {
+    enum_repr(e, &resolve_enum_vals(e))
+}
+
+fn emit_enum(e: &Enum) -> TokenStream {
+    // Resolve constant values (implicit = previous + 1), then pick an underlying
+    // integer type that fits them (or the fixed underlying type if declared).
+    let vals = resolve_enum_vals(e);
 
     let repr = enum_repr(e, &vals);
     let repr_tokens = repr.to_rust();

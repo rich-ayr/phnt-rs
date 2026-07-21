@@ -28,6 +28,8 @@ struct Cli {
 enum Command {
     /// Capture a clang JSON AST for one matrix cell (M0 driver reproduction).
     Ast(AstArgs),
+    /// Capture a clang record-layout dump for one matrix cell (verify ground truth).
+    Layout(LayoutCmdArgs),
     /// Parse a JSON AST into the phnt IR and report a summary (M1 IR check).
     Parse(ParseArgs),
     /// Generate a self-contained Rust `ffi` source from a JSON AST (M1 emit).
@@ -43,6 +45,47 @@ struct GenerateArgs {
     /// Where to write the generated `.rs`. Defaults to `target/phnt-gen/ffi.rs`.
     #[arg(long)]
     out: Option<PathBuf>,
+
+    /// Path to a clang record-layout dump (`phnt-bindgen layout`) for the *same*
+    /// cell. When given, append `#[cfg(test)]` layout-parity assertions (spec §8
+    /// check #2). Defaults to the cell's `target/phnt-ast/<cell>.layouts.txt` if it
+    /// exists; pass `--no-checks` to skip.
+    #[arg(long)]
+    checks: Option<PathBuf>,
+
+    /// Emit only the raw `ffi` with no layout-parity assertions.
+    #[arg(long)]
+    no_checks: bool,
+
+    /// Target architecture of the AST/layout dump — sets the pointer width used
+    /// for `#[repr]` and padding synthesis (x86 = 4 bytes, x64/arm64 = 8). Must
+    /// match the cell the AST was captured for.
+    #[arg(long, value_enum, default_value_t = ArchArg::X64)]
+    arch: ArchArg,
+}
+
+#[derive(clap::Args)]
+struct LayoutCmdArgs {
+    /// Version threshold: a `PHNT_WINDOWS_*` name, a feature slug (`win10`), or a
+    /// bare ordinal (`100`). Defaults to the Win10 floor.
+    #[arg(long, default_value = "win10")]
+    version: String,
+
+    /// Target architecture.
+    #[arg(long, value_enum, default_value_t = ArchArg::X64)]
+    arch: ArchArg,
+
+    /// Kernel surface (sets `PHNT_MODE=PHNT_MODE_KERNEL`; `/KERNEL` is TODO M6).
+    #[arg(long)]
+    kernel: bool,
+
+    /// Where to write the layout dump. Defaults to `target/phnt-ast/<cell>.layouts.txt`.
+    #[arg(long)]
+    out: Option<PathBuf>,
+
+    /// Print the resolved clang command line and exit without running it.
+    #[arg(long)]
+    print_cmdline: bool,
 }
 
 #[derive(clap::Args)]
@@ -106,9 +149,48 @@ fn main() -> Result<()> {
 
     match cli.cmd {
         Command::Ast(args) => run_ast(&root, args),
+        Command::Layout(args) => run_layout(&root, args),
         Command::Parse(args) => run_parse(&root, args),
         Command::Generate(args) => run_generate(&root, args),
     }
+}
+
+fn run_layout(root: &std::path::Path, args: LayoutCmdArgs) -> Result<()> {
+    let version = matrix::lookup(&args.version)
+        .with_context(|| format!("unknown --version `{}`", args.version))?;
+    let arch: Arch = args.arch.into();
+    let surface = if args.kernel { Surface::Kernel } else { Surface::User };
+
+    if surface == Surface::Kernel && !arch.supports_kernel() {
+        bail!("no kernel surface on {arch}: Windows loads no 32-bit kernel drivers (spec §4c)");
+    }
+
+    let cell = Cell::new(version, arch, surface);
+    let driver = Driver::from_root(root);
+    driver.preflight()?;
+
+    let wrapper = driver.write_wrapper(&cell)?;
+
+    if args.print_cmdline {
+        println!("{}", driver.layout_cmdline(&cell, &wrapper));
+        return Ok(());
+    }
+
+    let out = args
+        .out
+        .unwrap_or_else(|| driver.artifact_dir.join(format!("{}.layouts.txt", cell.label())));
+
+    eprintln!("[phnt-bindgen] cell {cell}");
+    eprintln!("[phnt-bindgen] $ {}", driver.layout_cmdline(&cell, &wrapper));
+    driver.capture_layouts(&cell, &wrapper, &out)?;
+
+    let bytes = std::fs::metadata(&out).map(|m| m.len()).unwrap_or(0);
+    eprintln!(
+        "[phnt-bindgen] wrote {} ({:.1} MiB)",
+        out.display(),
+        bytes as f64 / (1024.0 * 1024.0)
+    );
+    Ok(())
 }
 
 fn run_generate(root: &std::path::Path, args: GenerateArgs) -> Result<()> {
@@ -120,7 +202,28 @@ fn run_generate(root: &std::path::Path, args: GenerateArgs) -> Result<()> {
     let m = phnt_bindgen::ir::lower(&node);
     let idx = phnt_bindgen::universe::build_index(&node);
 
-    let src = phnt_bindgen::emit::emit(&m, &idx)?;
+    // Resolve the layout dump. It drives *both* faithful `#[repr]` selection
+    // (packed / over-aligned records) and the parity assertions (spec §8 check #2).
+    // Explicit `--checks` wins; otherwise fall back to the cell's default dump path
+    // if present. `--no-checks` suppresses only the appended assertions — the reprs
+    // are still corrected from the dump, since the AST lacks the pack/align values.
+    let layout_path = args.checks.clone().or_else(|| {
+        let default = ast.with_extension("layouts.txt");
+        default.exists().then_some(default)
+    });
+    let layouts = match &layout_path {
+        Some(p) => {
+            let text = std::fs::read_to_string(p)
+                .with_context(|| format!("reading layout dump {}", p.display()))?;
+            eprintln!("[phnt-bindgen] layout dump {}", p.display());
+            Some(phnt_bindgen::verify::parse_layouts(&text))
+        }
+        None => None,
+    };
+
+    let arch: Arch = args.arch.into();
+    let ptr_bytes = (arch.pointer_width() / 8) as u64;
+    let src = phnt_bindgen::emit::emit(&m, &idx, layouts.as_ref(), !args.no_checks, ptr_bytes)?;
 
     let out = args
         .out
@@ -175,7 +278,7 @@ fn run_parse(root: &std::path::Path, args: ParseArgs) -> Result<()> {
         let hoisted = m.records.iter().filter(|r| r.anon).count();
         let mut residual = 0usize;
         let mut named_refs: BTreeSet<String> = BTreeSet::new();
-        let mut collect = |t: &CType, residual: &mut usize, named: &mut BTreeSet<String>| {
+        let collect = |t: &CType, residual: &mut usize, named: &mut BTreeSet<String>| {
             if residual_anon(t) {
                 *residual += 1;
             }
