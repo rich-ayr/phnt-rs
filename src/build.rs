@@ -30,7 +30,7 @@ use regen::main;
 #[cfg_attr(docsrs, doc(cfg(not(feature = "regenerate"))))]
 #[cfg(not(feature = "regenerate"))]
 fn main() {
-   println!("Using vsendored bindings, build script skipped.");
+   println!("Using vendored bindings, build script skipped.");
 }
 
 #[cfg_attr(docsrs, doc(cfg(feature = "regenerate")))]
