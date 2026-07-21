@@ -11,7 +11,7 @@ use std::fmt;
 /// Target architecture. Drives the clang `--target` triple and, at emit time,
 /// the `target_arch` / `target_pointer_width` cfgs for genuinely arch-structural
 /// items (spec §5, fact 3).
-#[derive(Copy, Clone, PartialEq, Eq, Hash, Debug)]
+#[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
 pub enum Arch {
     /// `i686` — 32-bit. No kernel surface (Windows loads no 32-bit drivers).
     X86,
@@ -64,7 +64,7 @@ impl fmt::Display for Arch {
 /// Which API surface a cell parses. `Kernel` sets *both* the `PHNT_MODE` macro
 /// and the `/KERNEL` codegen flag in the driver (spec §4c — one logical switch,
 /// two clang args).
-#[derive(Copy, Clone, PartialEq, Eq, Hash, Debug)]
+#[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
 pub enum Surface {
     User,
     Kernel,

@@ -288,6 +288,86 @@ impl CallingConv {
 }
 
 // ---------------------------------------------------------------------------
+// Definition hashing (spec §7 `ir`; used by `merge` as the second half of the
+// `(name, definition_hash)` merge key — §9 "same-name / different-shape structs
+// across versions are real; the merge key must include definition_hash").
+// ---------------------------------------------------------------------------
+
+/// FNV-1a 64-bit over a byte string. Chosen over `DefaultHasher` deliberately:
+/// the hash keys merge grouping AND wants to be **stable across generator runs
+/// and Rust versions** (spec §9 determinism), which the SipHash-based default is
+/// not contracted to be. A canonical string → FNV keeps it trivially reproducible.
+fn fnv1a_64(s: &str) -> u64 {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in s.bytes() {
+        h ^= b as u64;
+        h = h.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    h
+}
+
+/// A stable, name-**independent** hash of an item's *definition shape*. Two decls
+/// with the same tag but a different layout (a field added/reordered/retyped
+/// between Windows versions) hash differently, so `merge` splits them into
+/// separate variants; two byte-identical decls captured from different cells hash
+/// the same, so `merge` folds them into one gated item. Provenance (`file`,
+/// `anon`) and the item's own tag are excluded — only the shape a consumer can
+/// observe through the ABI is hashed.
+impl Record {
+    pub fn definition_hash(&self) -> u64 {
+        let mut s = String::new();
+        s.push_str(if self.is_union { "union{" } else { "struct{" });
+        for f in &self.fields {
+            s.push_str(f.name.as_deref().unwrap_or(""));
+            s.push(':');
+            s.push_str(&ctype::render_debug(&f.ty));
+            if let Some(w) = &f.bitfield_width {
+                s.push('#');
+                s.push_str(w);
+            }
+            s.push(';');
+        }
+        s.push('}');
+        fnv1a_64(&s)
+    }
+}
+
+impl Enum {
+    pub fn definition_hash(&self) -> u64 {
+        let mut s = String::from("enum(");
+        s.push_str(self.underlying.as_deref().unwrap_or("int"));
+        s.push_str("){");
+        for c in &self.constants {
+            s.push_str(&c.name);
+            s.push('=');
+            s.push_str(c.value.as_deref().unwrap_or("_"));
+            s.push(';');
+        }
+        s.push('}');
+        fnv1a_64(&s)
+    }
+}
+
+impl Typedef {
+    pub fn definition_hash(&self) -> u64 {
+        fnv1a_64(&format!("typedef={}", ctype::render_debug(&self.ty)))
+    }
+}
+
+impl Function {
+    pub fn definition_hash(&self) -> u64 {
+        let mut s = format!("fn[{:?}](", self.calling_conv);
+        for p in &self.params {
+            s.push_str(&ctype::render_debug(&p.ty));
+            s.push(',');
+        }
+        s.push_str(")->");
+        s.push_str(&ctype::render_debug(&self.ret));
+        fnv1a_64(&s)
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Parse + lower
 // ---------------------------------------------------------------------------
 
