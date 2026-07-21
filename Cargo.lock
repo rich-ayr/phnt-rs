@@ -242,9 +242,9 @@ dependencies = [
 
 [[package]]
 name = "doxygen-bindgen"
-version = "0.1.3"
+version = "0.1.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "93ba4ed6eedf7f4ace1632149d8f0e8a65a480534024d65a7c3b9daacdedbad3"
+checksum = "86ae77832cf897427a5694552a3f87acc711cc35c61f40b0ff5812c58f87db3e"
 dependencies = [
  "yap",
 ]
