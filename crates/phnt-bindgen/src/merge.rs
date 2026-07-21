@@ -176,6 +176,157 @@ pub fn merge(cells: impl IntoIterator<Item = (Cell, Module)>) -> Merged {
     m
 }
 
+// ---------------------------------------------------------------------------
+// Gate derivation (spec §4a up-set fold + fact 3 arch split). Collapses a
+// variant's occurrence set into a compact, emittable predicate.
+// ---------------------------------------------------------------------------
+
+/// The captured matrix extent — every version ordinal / arch / surface that some
+/// cell was generated for. Needed to tell "gated out" from "never captured": a
+/// variant reaching the newest captured version is an **open** up-set `[min, ∞)`;
+/// one that stops earlier was **superseded** by a later shape and is bounded.
+#[derive(Clone, Debug, Default)]
+pub struct CapturedAxis {
+    pub versions: BTreeSet<u32>,
+    pub arches: BTreeSet<Arch>,
+    pub surfaces: BTreeSet<Surface>,
+    /// The set of matrix coordinates actually generated. A cell is "captured" iff
+    /// at least one item occurred in it (every real cell yields a non-empty
+    /// module), so this is the union of every variant's occurrences — NOT the full
+    /// `versions × arches × surfaces` product, which would invent sparse cells
+    /// (e.g. a 32-bit kernel cell, or an uncaptured version×arch) that were never
+    /// run and must not count as gate "phantoms".
+    pub cells: BTreeSet<Occ>,
+}
+
+impl CapturedAxis {
+    pub fn max_version(&self) -> Option<u32> {
+        self.versions.iter().copied().next_back()
+    }
+}
+
+/// A variant's emitted existence predicate, derived from its occurrences.
+/// Version dimension is an ordinal interval `[min_ordinal, max_ordinal]`
+/// (`max_ordinal = None` ⇒ open to ∞, the current shape); arch/surface dimensions
+/// are explicit sets (→ `#[cfg(target_arch)]` / the `kernel` feature at emit).
+/// `min_ordinal` is the **raw** minimum; the Win10-floor clamp (§4a) is an emit
+/// concern exposed via [`Gate::emit_min_ordinal`], so this predicate stays exact
+/// for every captured cell including sub-floor ones.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct Gate {
+    pub min_ordinal: u32,
+    pub max_ordinal: Option<u32>,
+    pub arches: BTreeSet<Arch>,
+    pub surfaces: BTreeSet<Surface>,
+}
+
+impl Gate {
+    /// Whether this gate admits cell `occ`.
+    pub fn enables(&self, occ: Occ) -> bool {
+        occ.ordinal >= self.min_ordinal
+            && self.max_ordinal.is_none_or(|mx| occ.ordinal <= mx)
+            && self.arches.contains(&occ.arch)
+            && self.surfaces.contains(&occ.surface)
+    }
+
+    /// The version ordinal the gate emits at: raw min raised to the Win10 floor
+    /// (spec §4a — sub-floor items collapse to the `win10` feature).
+    pub fn emit_min_ordinal(&self) -> u32 {
+        self.min_ordinal.max(crate::matrix::FLOOR_ORDINAL)
+    }
+
+    /// `true` if the gate spans every captured arch (⇒ no `target_arch` cfg needed).
+    pub fn is_all_arch(&self, axis: &CapturedAxis) -> bool {
+        self.arches == axis.arches
+    }
+}
+
+/// Derive the compact [`Gate`] for an occurrence set. `max_ordinal` is left open
+/// (`None`) when the variant reaches the newest captured version, else bounded to
+/// its own last occurrence (a later shape-variant supersedes it above that).
+pub fn derive_gate(occs: &BTreeSet<Occ>, axis: &CapturedAxis) -> Gate {
+    let min_ordinal = occs.iter().map(|o| o.ordinal).min().unwrap_or(0);
+    let max_occ = occs.iter().map(|o| o.ordinal).max().unwrap_or(0);
+    let max_ordinal = if Some(max_occ) == axis.max_version() { None } else { Some(max_occ) };
+    Gate {
+        min_ordinal,
+        max_ordinal,
+        arches: occs.iter().map(|o| o.arch).collect(),
+        surfaces: occs.iter().map(|o| o.surface).collect(),
+    }
+}
+
+/// A variant whose occurrences do **not** form a clean version-interval × arch ×
+/// surface rectangle, so its compact [`Gate`] would admit cells it never actually
+/// occurred in (a version gap, or arch×version entanglement needing per-arch
+/// ranges — spec fact 3 / M4). Reported, never silently emitted (spec §9).
+#[derive(Clone, Debug)]
+pub struct Irregular {
+    pub key: Key,
+    /// Cells the gate would admit but the variant never occurred in.
+    pub phantom: BTreeSet<Occ>,
+}
+
+impl Merged {
+    /// The captured extent, unioned over every variant's occurrences.
+    pub fn axis(&self) -> CapturedAxis {
+        let mut ax = CapturedAxis::default();
+        let mut add = |occs: &BTreeSet<Occ>| {
+            for &o in occs {
+                ax.versions.insert(o.ordinal);
+                ax.arches.insert(o.arch);
+                ax.surfaces.insert(o.surface);
+                ax.cells.insert(o);
+            }
+        };
+        for v in self.records.values() {
+            add(&v.occs);
+        }
+        for v in self.enums.values() {
+            add(&v.occs);
+        }
+        for v in self.typedefs.values() {
+            add(&v.occs);
+        }
+        for v in self.functions.values() {
+            add(&v.occs);
+        }
+        ax
+    }
+
+    /// Every variant whose compact gate is **not** faithful to its occurrences
+    /// (see [`Irregular`]). An empty result means every item is a clean rectangle
+    /// that emit can gate losslessly. The `phantom` set is computed against the
+    /// captured axis, so a gap only counts if that cell was actually generated.
+    pub fn irregular_variants(&self, axis: &CapturedAxis) -> Vec<Irregular> {
+        let mut out = Vec::new();
+        let mut check = |key: &Key, occs: &BTreeSet<Occ>| {
+            let gate = derive_gate(occs, axis);
+            // A phantom is a genuinely-captured cell the gate admits but the
+            // variant never occurred in — a version gap or arch×version
+            // entanglement. Uncaptured coordinates are ignored (see `cells`).
+            let phantom: BTreeSet<Occ> =
+                axis.cells.iter().copied().filter(|o| gate.enables(*o) && !occs.contains(o)).collect();
+            if !phantom.is_empty() {
+                out.push(Irregular { key: key.clone(), phantom });
+            }
+        };
+        for (k, v) in &self.records {
+            check(k, &v.occs);
+        }
+        for (k, v) in &self.enums {
+            check(k, &v.occs);
+        }
+        for (k, v) in &self.typedefs {
+            check(k, &v.occs);
+        }
+        for (k, v) in &self.functions {
+            check(k, &v.occs);
+        }
+        out
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -309,5 +460,80 @@ mod tests {
         assert_eq!(occs.len(), 2);
         assert!(occs.iter().any(|o| o.arch == Arch::X86_64));
         assert!(occs.iter().any(|o| o.arch == Arch::Aarch64));
+    }
+
+    // --- gate derivation -------------------------------------------------------
+
+    fn occ(ordinal: u32, arch: Arch) -> Occ {
+        Occ { ordinal, arch, surface: Surface::User }
+    }
+
+    #[test]
+    fn gate_open_upset_reaches_newest_version() {
+        // A present unchanged at v100 and v114 (both captured, newest = 114).
+        let a = rec("A", &[("f", CType::Prim(Prim::ULong))]);
+        let merged = merge([
+            (cell(100, Arch::X86_64), module(vec![a.clone()], vec![])),
+            (cell(114, Arch::X86_64), module(vec![a.clone()], vec![])),
+        ]);
+        let axis = merged.axis();
+        let g = derive_gate(&merged.records.values().next().unwrap().occs, &axis);
+        assert_eq!(g.min_ordinal, 100);
+        assert_eq!(g.max_ordinal, None, "reaches newest ⇒ open up-set");
+        assert!(g.enables(occ(114, Arch::X86_64)));
+        assert!(merged.irregular_variants(&axis).is_empty());
+    }
+
+    #[test]
+    fn gate_bounded_when_superseded_by_later_shape() {
+        // S is one shape at v100, a different shape at v114 (newest captured).
+        let s_old = rec("S", &[("a", CType::Prim(Prim::ULong))]);
+        let s_new = rec("S", &[("a", CType::Prim(Prim::ULong)), ("b", CType::Prim(Prim::ULong))]);
+        let merged = merge([
+            (cell(100, Arch::X86_64), module(vec![s_old.clone()], vec![])),
+            (cell(114, Arch::X86_64), module(vec![s_new.clone()], vec![])),
+        ]);
+        let axis = merged.axis();
+        for v in merged.records.values() {
+            let g = derive_gate(&v.occs, &axis);
+            match g.min_ordinal {
+                100 => assert_eq!(g.max_ordinal, Some(100), "old shape bounded below newest"),
+                114 => assert_eq!(g.max_ordinal, None, "current shape open"),
+                other => panic!("unexpected min_ordinal {other}"),
+            }
+        }
+        // Both variants are clean rectangles.
+        assert!(merged.irregular_variants(&axis).is_empty());
+    }
+
+    #[test]
+    fn irregular_flags_a_version_gap() {
+        // A occurs at v100 and v114 but NOT v107 — yet v107 was captured (Z is
+        // there). A's compact gate [100, ∞) would wrongly admit v107.
+        let a = rec("A", &[("f", CType::Prim(Prim::ULong))]);
+        let z = rec("Z", &[("g", CType::Prim(Prim::UShort))]);
+        let merged = merge([
+            (cell(100, Arch::X86_64), module(vec![a.clone(), z.clone()], vec![])),
+            (cell(107, Arch::X86_64), module(vec![z.clone()], vec![])),
+            (cell(114, Arch::X86_64), module(vec![a.clone(), z.clone()], vec![])),
+        ]);
+        let axis = merged.axis();
+        let irr = merged.irregular_variants(&axis);
+        assert_eq!(irr.len(), 1, "only A is irregular");
+        assert_eq!(irr[0].key.name, "A");
+        assert!(irr[0].phantom.contains(&occ(107, Arch::X86_64)));
+    }
+
+    #[test]
+    fn emit_min_ordinal_clamps_to_win10_floor() {
+        // A sub-floor variant (win7 = 61) collapses to the win10 feature at emit.
+        let g = Gate {
+            min_ordinal: 61,
+            max_ordinal: None,
+            arches: BTreeSet::from([Arch::X86_64]),
+            surfaces: BTreeSet::from([Surface::User]),
+        };
+        assert_eq!(g.emit_min_ordinal(), crate::matrix::FLOOR_ORDINAL);
+        assert_eq!(g.min_ordinal, 61, "raw min stays exact for round-trip");
     }
 }
