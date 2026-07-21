@@ -239,6 +239,47 @@ impl Gate {
     pub fn is_all_arch(&self, axis: &CapturedAxis) -> bool {
         self.arches == axis.arches
     }
+
+    /// The `#[cfg(...)]` predicate this gate compiles to — the text *inside*
+    /// `cfg(...)` — or `None` when the item is unconditional (present in every
+    /// emitted config: from the Win10 floor onward, on all captured arches).
+    ///
+    /// - version: an open up-set above the floor → `feature = "winNN"`; a bounded
+    ///   variant (a later shape supersedes it) → `not(feature = "<next-captured>")`,
+    ///   plus the lower `feature` bound when it sits above the floor.
+    /// - arch: a strict subset of the captured arches → `target_arch = "…"`
+    ///   (wrapped in `any(...)` for more than one).
+    ///
+    /// Parts combine with a flat `all(...)`. Feature-chain semantics (a newer
+    /// feature enabling all older ones, spec §4a) make a single lower `feature`
+    /// bound sufficient for an open up-set.
+    pub fn cfg_predicate(&self, axis: &CapturedAxis) -> Option<String> {
+        let mut parts: Vec<String> = Vec::new();
+
+        let emit_min = self.emit_min_ordinal();
+        if emit_min > crate::matrix::FLOOR_ORDINAL {
+            parts.push(format!("feature = \"{}\"", crate::matrix::feature_for_ordinal(emit_min)));
+        }
+        // A bounded variant stops below the newest captured version; gate it off
+        // once the next *captured* version's feature is enabled.
+        if let Some(max) = self.max_ordinal
+            && let Some(&next) = axis.versions.iter().find(|&&o| o > max)
+        {
+            parts.push(format!("not(feature = \"{}\")", crate::matrix::feature_for_ordinal(next)));
+        }
+
+        if self.arches != axis.arches {
+            let mut a: Vec<String> =
+                self.arches.iter().map(|ar| format!("target_arch = \"{}\"", ar.rust_arch())).collect();
+            parts.push(if a.len() == 1 { a.remove(0) } else { format!("any({})", a.join(", ")) });
+        }
+
+        match parts.len() {
+            0 => None,
+            1 => Some(parts.remove(0)),
+            _ => Some(format!("all({})", parts.join(", "))),
+        }
+    }
 }
 
 /// Derive the compact [`Gate`] for an occurrence set. `max_ordinal` is left open
@@ -537,5 +578,80 @@ mod tests {
         };
         assert_eq!(g.emit_min_ordinal(), crate::matrix::FLOOR_ORDINAL);
         assert_eq!(g.min_ordinal, 61, "raw min stays exact for round-trip");
+    }
+
+    // --- cfg predicate ---------------------------------------------------------
+
+    const ALL_ARCHES: [Arch; 3] = [Arch::X86, Arch::X86_64, Arch::Aarch64];
+
+    fn test_axis(versions: &[u32], arches: &[Arch]) -> CapturedAxis {
+        let mut ax = CapturedAxis::default();
+        for &v in versions {
+            ax.versions.insert(v);
+            for &a in arches {
+                ax.arches.insert(a);
+                ax.cells.insert(Occ { ordinal: v, arch: a, surface: Surface::User });
+            }
+        }
+        ax.surfaces.insert(Surface::User);
+        ax
+    }
+
+    fn test_gate(min: u32, max: Option<u32>, arches: &[Arch]) -> Gate {
+        Gate {
+            min_ordinal: min,
+            max_ordinal: max,
+            arches: arches.iter().copied().collect(),
+            surfaces: BTreeSet::from([Surface::User]),
+        }
+    }
+
+    #[test]
+    fn cfg_unconditional_is_none() {
+        // Floor, open up-set, all captured arches ⇒ present everywhere ⇒ no cfg.
+        let ax = test_axis(&[100, 114], &ALL_ARCHES);
+        assert_eq!(test_gate(100, None, &ALL_ARCHES).cfg_predicate(&ax), None);
+    }
+
+    #[test]
+    fn cfg_open_upset_above_floor() {
+        let ax = test_axis(&[100, 114], &ALL_ARCHES);
+        assert_eq!(
+            test_gate(114, None, &ALL_ARCHES).cfg_predicate(&ax).as_deref(),
+            Some("feature = \"win11\"")
+        );
+    }
+
+    #[test]
+    fn cfg_bounded_variant_gated_off_at_next_captured() {
+        // Present only at the floor; a later shape supersedes it — gate off once
+        // the next captured version (114 → win11) is enabled.
+        let ax = test_axis(&[100, 114], &ALL_ARCHES);
+        assert_eq!(
+            test_gate(100, Some(100), &ALL_ARCHES).cfg_predicate(&ax).as_deref(),
+            Some("not(feature = \"win11\")")
+        );
+    }
+
+    #[test]
+    fn cfg_arch_subset() {
+        let ax = test_axis(&[100], &ALL_ARCHES);
+        assert_eq!(
+            test_gate(100, None, &[Arch::X86]).cfg_predicate(&ax).as_deref(),
+            Some("target_arch = \"x86\"")
+        );
+        assert_eq!(
+            test_gate(100, None, &[Arch::X86_64, Arch::Aarch64]).cfg_predicate(&ax).as_deref(),
+            Some("any(target_arch = \"x86_64\", target_arch = \"aarch64\")")
+        );
+    }
+
+    #[test]
+    fn cfg_combines_version_and_arch() {
+        let ax = test_axis(&[100, 114], &ALL_ARCHES);
+        assert_eq!(
+            test_gate(114, None, &[Arch::X86_64]).cfg_predicate(&ax).as_deref(),
+            Some("all(feature = \"win11\", target_arch = \"x86_64\")")
+        );
     }
 }

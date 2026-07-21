@@ -158,6 +158,18 @@ pub fn floor() -> Version {
         .expect("FLOOR_ORDINAL must exist in VERSIONS")
 }
 
+/// The Cargo feature slug for an ordinal, clamped up to the Win10 floor (spec
+/// §4a — sub-floor items collapse to `win10`). An unrecognized ordinal falls back
+/// to the floor feature. Used by `merge` to build `#[cfg(feature = …)]` gates.
+pub fn feature_for_ordinal(ordinal: u32) -> &'static str {
+    let clamped = ordinal.max(FLOOR_ORDINAL);
+    VERSIONS
+        .iter()
+        .find(|v| v.ordinal == clamped)
+        .map(|v| v.feature)
+        .unwrap_or_else(|| floor().feature)
+}
+
 /// One cell of the config matrix: a single clang invocation's worth of config.
 #[derive(Copy, Clone, PartialEq, Eq, Hash, Debug)]
 pub struct Cell {
