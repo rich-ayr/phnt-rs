@@ -1,3 +1,7 @@
+[workspace]
+members = ["crates/phnt-bindgen"]
+resolver = "2"
+
 [package]
 name = "phnt"
 version = "0.1.2"
