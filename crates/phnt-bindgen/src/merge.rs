@@ -354,15 +354,17 @@ mod tests {
                     name: Some(n.to_string()),
                     ty: t.clone(),
                     bitfield_width: None,
+                    doc: None,
                 })
                 .collect(),
             file: "synthetic.h".to_string(),
             anon: false,
+            doc: None,
         }
     }
 
     fn tdef(name: &str, ty: CType) -> Typedef {
-        Typedef { name: name.to_string(), ty, file: "synthetic.h".to_string() }
+        Typedef { name: name.to_string(), ty, file: "synthetic.h".to_string(), doc: None }
     }
 
     fn module(records: Vec<Record>, typedefs: Vec<Typedef>) -> Module {

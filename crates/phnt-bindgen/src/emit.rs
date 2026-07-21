@@ -310,6 +310,26 @@ impl Repr {
     }
 }
 
+/// Render an item's raw Doxygen doc string (captured by `ir::extract_doc`) to
+/// rustdoc `#[doc = …]` attributes via `doxygen_bindgen::transform`. One attr per
+/// line so prettyplease renders them as `///` comments. Whitespace-only → nothing;
+/// a transform error falls back to the raw text so no documentation is lost.
+fn doc_attrs(doc: &Option<String>) -> TokenStream {
+    let Some(raw) = doc.as_deref() else { return quote!() };
+    if raw.trim().is_empty() {
+        return quote!();
+    }
+    let rendered = doxygen_bindgen::transform(raw).unwrap_or_else(|_| raw.to_string());
+    if rendered.trim().is_empty() {
+        return quote!();
+    }
+    let attrs = rendered.lines().map(|line| {
+        let text = format!(" {}", line.trim_end());
+        quote! { #[doc = #text] }
+    });
+    quote! { #(#attrs)* }
+}
+
 fn emit_record(r: &Record, repr: Repr, cx: &AlignCtx) -> TokenStream {
     let name_str = r.name.as_deref().unwrap_or("_anon");
     let name = ident(name_str);
@@ -323,14 +343,17 @@ fn emit_record(r: &Record, repr: Repr, cx: &AlignCtx) -> TokenStream {
         .and_then(|l| synth_padded_fields(r, l, cx))
         .unwrap_or_else(|| emit_fields(&r.fields, cx.typedefs));
     let attr = repr.attr();
+    let doc = doc_attrs(&r.doc);
     if r.is_union {
         quote! {
+            #doc
             #attr
             #[derive(Copy, Clone)]
             pub union #name { #body }
         }
     } else {
         quote! {
+            #doc
             #attr
             #[derive(Copy, Clone)]
             pub struct #name { #body }
@@ -728,7 +751,8 @@ fn emit_typedef(t: &Typedef) -> Option<TokenStream> {
     if ctype::sanitize_ident(&t.name) == ty.to_string().trim() {
         return None;
     }
-    Some(quote! { pub type #name = #ty; })
+    let doc = doc_attrs(&t.doc);
+    Some(quote! { #doc pub type #name = #ty; })
 }
 
 // --- enums (constified) ----------------------------------------------------
@@ -771,7 +795,9 @@ fn emit_enum(e: &Enum) -> TokenStream {
     match &e.name {
         Some(tag) => {
             let tn = ident(tag);
+            let doc = doc_attrs(&e.doc);
             quote! {
+                #doc
                 pub type #tn = #repr_tokens;
                 #(#consts)*
             }
@@ -868,5 +894,6 @@ fn emit_fn_decl(f: &Function) -> TokenStream {
             quote! { -> #t }
         }
     };
-    quote! { pub fn #name(#(#params),*) #ret; }
+    let doc = doc_attrs(&f.doc);
+    quote! { #doc pub fn #name(#(#params),*) #ret; }
 }

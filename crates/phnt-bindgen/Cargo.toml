@@ -25,3 +25,4 @@ proc-macro2 = "1"
 quote = "1"
 syn = { version = "3", features = ["full", "parsing", "printing", "extra-traits"] }
 prettyplease = "0.3"
+doxygen-bindgen = "0.1.3"

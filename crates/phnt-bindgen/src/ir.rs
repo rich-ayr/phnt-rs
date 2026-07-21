@@ -138,6 +138,35 @@ pub struct ValueExpr {
     pub value: Option<String>,
 }
 
+/// A leaf `TextComment` — the literal prose of a doc comment, already stripped of
+/// the `/**`, `*/`, and leading ` * ` markers by clang.
+#[derive(Deserialize, Default, Clone, Debug)]
+pub struct TextComment {
+    pub text: Option<String>,
+}
+
+/// A `\brief` / `\return` / `\note` … block command; `name` is the command word
+/// (no leading `\`/`@`). Its argument prose lives in child `ParagraphComment`s.
+#[derive(Deserialize, Default, Clone, Debug)]
+pub struct BlockCommandComment {
+    pub name: Option<String>,
+}
+
+/// A `\param NAME …` command; `param` is the documented parameter name. Its
+/// description lives in child `ParagraphComment`s.
+#[derive(Deserialize, Default, Clone, Debug)]
+pub struct ParamCommandComment {
+    pub param: Option<String>,
+}
+
+/// An inline `\c`/`\b`/`\p`… command with its rendered `args` (e.g. `\c FOO`).
+#[derive(Deserialize, Default, Clone, Debug)]
+pub struct InlineCommandComment {
+    pub name: Option<String>,
+    #[serde(default)]
+    pub args: Vec<String>,
+}
+
 /// The clang AST node kinds we model. Variant names must match clang's `kind`
 /// strings exactly; `clang-ast` drives selection via its own `deserialize_enum`
 /// (NOT serde internal tagging — that path can't handle clang's kind-less `{}`
@@ -158,6 +187,14 @@ pub enum Clang {
     /// A function *body*. Its presence as a `FunctionDecl` child marks that decl
     /// as a definition (an inline helper here) rather than a bare prototype.
     CompoundStmt,
+    // Doc-comment subtree, attached by clang as an `inner` child of a documented
+    // decl. Walked by `extract_doc` (variant names match clang's `kind` strings).
+    FullComment,
+    ParagraphComment,
+    TextComment(TextComment),
+    BlockCommandComment(BlockCommandComment),
+    ParamCommandComment(ParamCommandComment),
+    InlineCommandComment(InlineCommandComment),
     Other,
 }
 
@@ -199,6 +236,9 @@ pub struct Record {
     pub file: String,
     /// `true` if this record was hoisted from an anonymous member.
     pub anon: bool,
+    /// Cleaned Doxygen doc-comment text (see [`extract_doc`]); provenance, NOT
+    /// part of [`Record::definition_hash`].
+    pub doc: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -209,6 +249,8 @@ pub struct Field {
     pub ty: CType,
     /// Bit width for bitfield members.
     pub bitfield_width: Option<String>,
+    /// Cleaned Doxygen doc-comment text for this member.
+    pub doc: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -217,6 +259,8 @@ pub struct Enum {
     pub underlying: Option<String>,
     pub constants: Vec<EnumConst>,
     pub file: String,
+    /// Cleaned Doxygen doc-comment text; provenance, not part of the hash.
+    pub doc: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -232,6 +276,8 @@ pub struct Typedef {
     pub name: String,
     pub ty: CType,
     pub file: String,
+    /// Cleaned Doxygen doc-comment text; provenance, not part of the hash.
+    pub doc: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -251,6 +297,8 @@ pub struct Function {
     pub storage_class: Option<String>,
     pub inline_keyword: bool,
     pub file: String,
+    /// Cleaned Doxygen doc-comment text; provenance, not part of the hash.
+    pub doc: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -368,6 +416,84 @@ impl Function {
 }
 
 // ---------------------------------------------------------------------------
+// Doc comments (spec next-action: Doxygen → rustdoc). Reconstruct the cleaned
+// Doxygen body from clang's parsed comment subtree; `emit` runs it through
+// `doxygen_bindgen::transform`. Reconstruction (not source-slicing) keeps this
+// purely on the AST — no header reads, no byte-offset/`tokLen` precision, no
+// delimiter/CRLF stripping, and it dodges clang's flaky comment loc-file
+// attribution. Comment text is provenance and is excluded from `definition_hash`.
+// ---------------------------------------------------------------------------
+
+/// Reconstruct a decl's doc comment as cleaned Doxygen text, or `None` if it has
+/// no `FullComment`. clang has already stripped comment markers and parsed each
+/// `\brief`/`\param`/`\return` into a structured child, so we re-emit those as
+/// `@command` lines (which `doxygen_bindgen::transform` recognizes) and pass
+/// paragraph prose through verbatim.
+pub fn extract_doc(node: &Node) -> Option<String> {
+    let full = node.inner.iter().find(|c| matches!(c.kind, Clang::FullComment))?;
+    let mut blocks: Vec<String> = Vec::new();
+    for child in &full.inner {
+        match &child.kind {
+            Clang::ParagraphComment => {
+                let t = paragraph_text(child);
+                if !t.is_empty() {
+                    blocks.push(t);
+                }
+            }
+            Clang::BlockCommandComment(b) => {
+                let name = b.name.as_deref().unwrap_or_default();
+                let body = command_body(child);
+                blocks.push(format!("@{name} {body}").trim_end().to_string());
+            }
+            Clang::ParamCommandComment(p) => {
+                let param = p.param.as_deref().unwrap_or_default();
+                let body = command_body(child);
+                blocks.push(format!("@param {param} {body}").trim_end().to_string());
+            }
+            _ => {}
+        }
+    }
+    let doc = blocks.join("\n");
+    if doc.trim().is_empty() { None } else { Some(doc) }
+}
+
+/// The prose of a block/param command: its child `ParagraphComment`s, flattened.
+fn command_body(node: &Node) -> String {
+    node.inner
+        .iter()
+        .filter(|n| matches!(n.kind, Clang::ParagraphComment))
+        .map(paragraph_text)
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// Flatten a `ParagraphComment` to a single line: its `TextComment` prose (one
+/// child per source line, each trimmed) plus any inline `\c`/`\b`… commands,
+/// re-emitted so `transform` can render them.
+fn paragraph_text(node: &Node) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    for child in &node.inner {
+        match &child.kind {
+            Clang::TextComment(t) => {
+                if let Some(s) = &t.text {
+                    let s = s.trim();
+                    if !s.is_empty() {
+                        parts.push(s.to_string());
+                    }
+                }
+            }
+            Clang::InlineCommandComment(c) => {
+                let name = c.name.as_deref().unwrap_or_default();
+                let args = c.args.join(" ");
+                parts.push(format!("@{name} {args}").trim_end().to_string());
+            }
+            _ => {}
+        }
+    }
+    parts.join(" ")
+}
+
+// ---------------------------------------------------------------------------
 // Parse + lower
 // ---------------------------------------------------------------------------
 
@@ -428,7 +554,12 @@ pub fn lower(root: &Node) -> Module {
                 if !is_phnt_file(&file) {
                     continue;
                 }
-                m.typedefs.push(Typedef { name, ty: ctype::parse(t.ty.c_type()), file });
+                m.typedefs.push(Typedef {
+                    name,
+                    ty: ctype::parse(t.ty.c_type()),
+                    file,
+                    doc: extract_doc(node),
+                });
             }
             Clang::FunctionDecl(f) => {
                 if f.is_implicit {
@@ -513,10 +644,17 @@ pub fn lower_record(node: &Node, name: String, file: String, anon: bool, out: &m
         } else {
             None
         };
-        fields.push(Field { name: fd.name.clone(), ty, bitfield_width });
+        fields.push(Field { name: fd.name.clone(), ty, bitfield_width, doc: extract_doc(child) });
     }
 
-    out.push(Record { name: Some(name), is_union, fields, file: file.clone(), anon });
+    out.push(Record {
+        name: Some(name),
+        is_union,
+        fields,
+        file: file.clone(),
+        anon,
+        doc: extract_doc(node),
+    });
 
     for (synth, anon_node) in hoist {
         lower_record(anon_node, synth, file.clone(), true, out);
@@ -549,7 +687,7 @@ pub fn lower_typedef_node(node: &Node) -> Option<Typedef> {
     if let Clang::TypedefDecl(t) = &node.kind {
         let name = t.name.clone()?;
         let file = node_file(&t.loc).unwrap_or_default();
-        Some(Typedef { name, ty: ctype::parse(t.ty.c_type()), file })
+        Some(Typedef { name, ty: ctype::parse(t.ty.c_type()), file, doc: extract_doc(node) })
     } else {
         None
     }
@@ -568,7 +706,7 @@ fn lower_enum(node: &Node, e: &EnumDecl, file: String) -> Enum {
         }
     }
     let underlying = e.fixed_underlying_type.as_ref().map(|t| t.c_type().to_string());
-    Enum { name: e.name.clone(), underlying, constants, file }
+    Enum { name: e.name.clone(), underlying, constants, file, doc: extract_doc(node) }
 }
 
 fn lower_function(node: &Node, f: &FunctionDecl, name: String, file: String) -> Function {
@@ -601,5 +739,6 @@ fn lower_function(node: &Node, f: &FunctionDecl, name: String, file: String) -> 
         storage_class: f.storage_class.clone(),
         inline_keyword: f.inline,
         file,
+        doc: extract_doc(node),
     }
 }

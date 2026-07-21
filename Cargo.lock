@@ -242,9 +242,9 @@ dependencies = [
 
 [[package]]
 name = "doxygen-bindgen"
-version = "0.1.2"
+version = "0.1.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "fc1a25cf11ca7979e47cb2d4068bd0dc35001138bb55add6ed36961dedd42610"
+checksum = "93ba4ed6eedf7f4ace1632149d8f0e8a65a480534024d65a7c3b9daacdedbad3"
 dependencies = [
  "yap",
 ]
@@ -424,6 +424,7 @@ dependencies = [
  "anyhow",
  "clang-ast",
  "clap",
+ "doxygen-bindgen",
  "prettyplease 0.3.0",
  "proc-macro2",
  "quote",
