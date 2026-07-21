@@ -1,9 +1,8 @@
 name: "cargo"
 on:
+  # Auto-CI disabled while master is intentionally in a broken state
+  # (bindgen removed, generator not yet wired in). Manual dispatch only.
   workflow_dispatch:
-  push:
-    branches:
-      - master
 
 env:
   CARGO_TERM_COLOR: always
