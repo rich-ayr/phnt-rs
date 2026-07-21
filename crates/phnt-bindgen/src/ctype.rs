@@ -287,10 +287,9 @@ fn prim(b: &str) -> Option<PrimOrSpecial> {
 fn anon_loc(s: &str) -> Option<String> {
     let rest = if let Some(i) = s.find("(unnamed at ") {
         &s[i + "(unnamed at ".len()..]
-    } else if let Some(i) = s.find("(anonymous at ") {
-        &s[i + "(anonymous at ".len()..]
     } else {
-        return None;
+        let i = s.find("(anonymous at ")?;
+        &s[i + "(anonymous at ".len()..]
     };
     let inner = rest.strip_suffix(')')?;
     Some(inner.trim().to_string())

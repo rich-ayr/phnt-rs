@@ -622,8 +622,8 @@ pub fn lower_record(node: &Node, name: String, file: String, anon: bool, out: &m
     for child in &node.inner {
         let Clang::FieldDecl(fd) = &child.kind else { continue };
         let mut ty = ctype::parse(fd.ty.c_type());
-        if has_anon(&ty) {
-            if let Some(anon_node) = anon_defs.get(anon_idx).copied() {
+        if has_anon(&ty)
+            && let Some(anon_node) = anon_defs.get(anon_idx).copied() {
                 anon_idx += 1;
                 let synth = format!("{name}__anon{anon_idx}");
                 ty.map_leaves(&mut |leaf| {
@@ -635,7 +635,6 @@ pub fn lower_record(node: &Node, name: String, file: String, anon: bool, out: &m
             }
             // else: no matching anon def (shouldn't happen) — leaf stays `Anon`,
             // which emit renders as an opaque placeholder + logs.
-        }
         let bitfield_width = if fd.is_bitfield {
             child.inner.iter().find_map(|n| match &n.kind {
                 Clang::ConstantExpr(v) | Clang::IntegerLiteral(v) => v.value.clone(),
@@ -664,12 +663,11 @@ pub fn lower_record(node: &Node, name: String, file: String, anon: bool, out: &m
 /// Lower a record `Node` (from the universe index) into `out`, recursively —
 /// used by `emit` to pull in external SDK records reached by the closure.
 pub fn lower_record_node(node: &Node, out: &mut Vec<Record>) {
-    if let Clang::RecordDecl(r) = &node.kind {
-        if let Some(name) = r.name.clone() {
+    if let Clang::RecordDecl(r) = &node.kind
+        && let Some(name) = r.name.clone() {
             let file = node_file(&r.loc).unwrap_or_default();
             lower_record(node, name, file, false, out);
         }
-    }
 }
 
 /// Lower an enum `Node` (from the universe index), for `emit`'s closure.
