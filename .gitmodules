@@ -1,4 +1,4 @@
 [submodule "deps/phnt-nightly"]
 	path = deps/phnt-nightly
-	url = https://github.com/oberrich/phnt_nightly.git
+	url = https://github.com/rich-ayr/phnt_nightly.git
 	branch = master
