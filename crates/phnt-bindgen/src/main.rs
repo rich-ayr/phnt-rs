@@ -34,6 +34,34 @@ enum Command {
     Parse(ParseArgs),
     /// Generate a self-contained Rust `ffi` source from a JSON AST (M1 emit).
     Generate(GenerateArgs),
+    /// Merge multiple versions of one arch into one `#[cfg]`-gated `ffi` (§4a/§8.4).
+    GenerateMerged(GenerateMergedArgs),
+}
+
+#[derive(clap::Args)]
+struct GenerateMergedArgs {
+    /// Versions to merge, ascending (repeat `--version` or comma-separate). Each
+    /// resolves to `target/phnt-ast/<arch>-<feature>-user.json` (+ `.layouts.txt`).
+    /// Defaults to the win10+win11 pair captured for the x64/user cell.
+    #[arg(long = "version", value_delimiter = ',', default_values = ["win10", "win11"])]
+    versions: Vec<String>,
+
+    /// Target architecture — must match the captured cells (all share one arch).
+    #[arg(long, value_enum, default_value_t = ArchArg::X64)]
+    arch: ArchArg,
+
+    /// Where to write the merged `.rs`. Defaults to `target/phnt-gen/ffi-merged.rs`.
+    #[arg(long)]
+    out: Option<PathBuf>,
+
+    /// Where to write the Cargo `[features]` chain (spec §4a). Defaults to
+    /// `target/phnt-gen/features.toml`.
+    #[arg(long)]
+    features_out: Option<PathBuf>,
+
+    /// Emit only the raw gated `ffi` with no layout-parity assertions.
+    #[arg(long)]
+    no_checks: bool,
 }
 
 #[derive(clap::Args)]
@@ -152,6 +180,7 @@ fn main() -> Result<()> {
         Command::Layout(args) => run_layout(&root, args),
         Command::Parse(args) => run_parse(&root, args),
         Command::Generate(args) => run_generate(&root, args),
+        Command::GenerateMerged(args) => run_generate_merged(&root, args),
     }
 }
 
@@ -239,6 +268,65 @@ fn run_generate(root: &std::path::Path, args: GenerateArgs) -> Result<()> {
         src.lines().count(),
         src.len() as f64 / 1024.0
     );
+    Ok(())
+}
+
+fn run_generate_merged(root: &std::path::Path, args: GenerateMergedArgs) -> Result<()> {
+    let arch: Arch = args.arch.into();
+    let ptr_bytes = (arch.pointer_width() / 8) as u64;
+    let artifact_dir = root.join("target").join("phnt-ast");
+
+    // Resolve each version to its captured AST (+ optional layout dump) by the
+    // artifact naming convention. Ascending order makes the oldest cell the
+    // representative for shared variants (least churn vs the single-cell output).
+    let mut specs: Vec<phnt_bindgen::emit::CellSpec> = Vec::new();
+    let mut versions: Vec<matrix::Version> = args
+        .versions
+        .iter()
+        .map(|v| matrix::lookup(v).with_context(|| format!("unknown --version `{v}`")))
+        .collect::<Result<_>>()?;
+    versions.sort_by_key(|v| v.ordinal);
+    versions.dedup_by_key(|v| v.ordinal);
+
+    for version in versions {
+        let cell = Cell::new(version, arch, Surface::User);
+        let ast = artifact_dir.join(format!("{}.json", cell.label()));
+        if !ast.exists() {
+            bail!(
+                "missing AST for {cell}: {}\n  capture it with: phnt-bindgen ast --version {} --arch {}",
+                ast.display(),
+                version.feature,
+                arch.rust_arch(),
+            );
+        }
+        let layout = ast.with_extension("layouts.txt");
+        let layout_path = layout.exists().then_some(layout);
+        specs.push(phnt_bindgen::emit::CellSpec { cell, ast_path: ast, layout_path, ptr_bytes });
+    }
+
+    eprintln!("[phnt-bindgen] merging {} cell(s) for {}", specs.len(), arch.rust_arch());
+    let src = phnt_bindgen::emit::emit_merged(&specs, !args.no_checks)?;
+
+    let out = args
+        .out
+        .unwrap_or_else(|| root.join("target").join("phnt-gen").join("ffi-merged.rs"));
+    if let Some(parent) = out.parent() {
+        std::fs::create_dir_all(parent).ok();
+    }
+    std::fs::write(&out, &src).with_context(|| format!("writing {}", out.display()))?;
+    eprintln!(
+        "[phnt-bindgen] wrote {} ({} lines, {:.1} KiB)",
+        out.display(),
+        src.lines().count(),
+        src.len() as f64 / 1024.0
+    );
+
+    let features = args
+        .features_out
+        .unwrap_or_else(|| root.join("target").join("phnt-gen").join("features.toml"));
+    std::fs::write(&features, matrix::feature_chain_toml())
+        .with_context(|| format!("writing {}", features.display()))?;
+    eprintln!("[phnt-bindgen] wrote feature chain {}", features.display());
     Ok(())
 }
 

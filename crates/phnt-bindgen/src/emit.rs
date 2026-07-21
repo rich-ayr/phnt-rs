@@ -16,14 +16,18 @@
 //! alignment, no accessors (those belong in `ext`).
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::path::PathBuf;
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use proc_macro2::TokenStream;
 use quote::{format_ident, quote};
 
 use crate::ctype::{self, CType, Prim};
 use crate::ir::{CallingConv, Enum, Function, Module, Record, Typedef};
+use crate::matrix::Cell;
+use crate::merge::{CapturedAxis, Key, Kind, Occ, derive_gate};
 use crate::universe::Index;
+use crate::verify::{CheckStats, LayoutMap};
 
 /// The resolved, self-contained set of items to emit for one cell.
 #[derive(Default)]
@@ -65,6 +69,438 @@ pub fn emit(
     }
     let file = syn::parse2::<syn::File>(tokens).context("emitted tokens are not valid Rust")?;
     Ok(prettyplease::unparse(&file))
+}
+
+// ---------------------------------------------------------------------------
+// Merged (multi-cell) emission — spec §5 stage 4/5, §8.4/§8.5.
+//
+// Consumes the `(version × arch × surface)` matrix instead of one `Module`, folds
+// every cell's *closure* (roots + on-demand SDK types) into one gated universe,
+// and stamps each item's `#[cfg(...)]` from its occurrence set (`merge::Gate`).
+//
+// **Why merge closures, not roots:** the closure of cell C already contains every
+// type an emitted item in C references. So if item A occurs in C, every type A
+// uses also occurs in C — hence each referenced type's gate is *at least as loose*
+// as A's, and the gate-closure invariant `cfg(A) ⇒ cfg(T)` (§4b(2)) holds **by
+// construction**. `check_gate_closure` verifies this rather than having to repair
+// it (it should never fire); a violation would signal a closure/merge bug.
+// ---------------------------------------------------------------------------
+
+/// One matrix cell's on-disk inputs for [`emit_merged`]. Files are parsed lazily
+/// inside the fold so only one ~300 MB AST is resident at a time.
+pub struct CellSpec {
+    pub cell: Cell,
+    pub ast_path: PathBuf,
+    /// Optional clang record-layout dump for this cell (drives `#[repr]` selection
+    /// *and* the gated parity assertions).
+    pub layout_path: Option<PathBuf>,
+    /// Target pointer width in bytes (4 on x86, 8 on x64/arm64).
+    pub ptr_bytes: u64,
+}
+
+/// The accumulated, rendered-once-per-variant state folded across all cells.
+/// Everything is keyed by [`Key`] `(kind, name, definition_hash)` so a same-named
+/// item whose shape changed between versions splits into gate-disjoint variants.
+#[derive(Default)]
+struct FoldState {
+    occs: BTreeMap<Key, BTreeSet<Occ>>,
+    refs: BTreeMap<Key, BTreeSet<String>>,
+    /// Records need per-cell context (`#[repr]`, padding, layout), so they are
+    /// rendered in the first cell a variant is seen in; enums/typedefs/functions
+    /// render context-free from any occurrence.
+    rec_tokens: BTreeMap<Key, TokenStream>,
+    rec_checks: BTreeMap<Key, TokenStream>,
+    enum_tokens: BTreeMap<Key, TokenStream>,
+    typedef_tokens: BTreeMap<Key, TokenStream>,
+    /// `(abi, decl)` — abi groups the extern block, decl is gated inside it.
+    fn_tokens: BTreeMap<Key, (&'static str, TokenStream)>,
+    opaque_occs: BTreeMap<String, BTreeSet<Occ>>,
+    stats: CheckStats,
+}
+
+/// Emit one self-contained, `#[cfg]`-gated Rust `ffi` source folding every cell in
+/// `cells` (which must share an arch; the version axis is what gates). When
+/// `append_checks`, a per-variant-gated `#[cfg(test)] mod _layout_checks` is added.
+///
+/// The §8.4 round-trip (`filter(merged, cell) == cell`) and §8.5 gate closure are
+/// both enforced here: closure membership is what the occurrence sets encode, and
+/// [`check_gate_closure`] fails generation if any edge escapes its referent's gate.
+pub fn emit_merged(cells: &[CellSpec], append_checks: bool) -> Result<String> {
+    if cells.is_empty() {
+        bail!("emit_merged: no cells");
+    }
+    let mut st = FoldState::default();
+
+    for spec in cells {
+        fold_cell(spec, append_checks, &mut st)?;
+    }
+
+    // Captured extent, over every variant's occurrences (records guarantee every
+    // cell is represented; opaque folds in too for completeness).
+    let mut axis = CapturedAxis::default();
+    let extend_axis = |set: &BTreeSet<Occ>, axis: &mut CapturedAxis| {
+        for &o in set {
+            axis.versions.insert(o.ordinal);
+            axis.arches.insert(o.arch);
+            axis.surfaces.insert(o.surface);
+            axis.cells.insert(o);
+        }
+    };
+    for set in st.occs.values() {
+        extend_axis(set, &mut axis);
+    }
+    for set in st.opaque_occs.values() {
+        extend_axis(set, &mut axis);
+    }
+
+    // Occurrence union by name over the *defined* kinds (record/enum/typedef) —
+    // needed both to suppress opaque stubs where a real definition exists and for
+    // the gate-closure check.
+    let defined_by_name = defined_occs_by_name(&st.occs);
+
+    check_round_trip(&st, &axis)?;
+    check_gate_closure(&st, &defined_by_name)?;
+
+    // A gate → `#[cfg(...)]` predicate for an occurrence set.
+    let pred_of = |set: &BTreeSet<Occ>| derive_gate(set, &axis).cfg_predicate(&axis);
+
+    // --- assemble each section (opaque, typedefs, enums, records, funcs) --------
+    let opaque = assemble_opaque(&st, &defined_by_name, &axis);
+
+    let typedefs = st
+        .typedef_tokens
+        .iter()
+        .map(|(k, t)| stamp_cfg(&pred_of(&st.occs[k]), t.clone()))
+        .collect::<Vec<_>>();
+    let enums = st
+        .enum_tokens
+        .iter()
+        .map(|(k, e)| stamp_cfg(&pred_of(&st.occs[k]), e.clone()))
+        .collect::<Vec<_>>();
+    let records = st
+        .rec_tokens
+        .iter()
+        .map(|(k, r)| stamp_cfg(&pred_of(&st.occs[k]), r.clone()))
+        .collect::<Vec<_>>();
+    let funcs = assemble_functions(&st, &pred_of);
+
+    let checks = if append_checks {
+        let items = st
+            .rec_checks
+            .iter()
+            .map(|(k, c)| stamp_cfg(&pred_of(&st.occs[k]), c.clone()))
+            .collect::<Vec<_>>();
+        eprintln!(
+            "[phnt-bindgen] merged layout parity: {} records matched, {} unmatched, {} anon skipped, \
+             {} known-divergent; {} size+align, {} offset asserts (gated across {} versions)",
+            st.stats.matched,
+            st.stats.unmatched,
+            st.stats.anon_skipped,
+            st.stats.known_divergent,
+            st.stats.size_checks,
+            st.stats.offset_checks,
+            axis.versions.len(),
+        );
+        crate::verify::wrap_layout_checks(items)
+    } else {
+        quote!()
+    };
+
+    eprintln!(
+        "[phnt-bindgen] merged: {} record variants, {} enums, {} typedefs, {} fns, {} opaque; \
+         versions {:?}",
+        st.rec_tokens.len(),
+        st.enum_tokens.len(),
+        st.typedef_tokens.len(),
+        st.fn_tokens.len(),
+        opaque.len(),
+        axis.versions,
+    );
+
+    let tokens = quote! {
+        //! Auto-generated by `phnt-bindgen`. DO NOT EDIT.
+        //!
+        //! Raw, self-contained `#[repr(C)]` FFI for the phnt native Windows headers,
+        //! merged across the version matrix with `#[cfg(feature = "winNN")]` gates.
+        #![allow(non_camel_case_types, non_snake_case, non_upper_case_globals, dead_code)]
+
+        #(#opaque)*
+        #(#typedefs)*
+        #(#enums)*
+        #(#records)*
+        #funcs
+        #checks
+    };
+
+    let file = syn::parse2::<syn::File>(tokens).context("merged tokens are not valid Rust")?;
+    Ok(prettyplease::unparse(&file))
+}
+
+/// Parse, lower, index and close one cell, then render/record every closure item
+/// into `st`. The heavy AST is dropped when this returns (only rendered tokens and
+/// occurrence coordinates are retained).
+fn fold_cell(spec: &CellSpec, append_checks: bool, st: &mut FoldState) -> Result<()> {
+    eprintln!("[phnt-bindgen] merge cell {} ← {}", spec.cell, spec.ast_path.display());
+    let node = crate::ir::parse_ast(&spec.ast_path)?;
+    let module = crate::ir::lower(&node);
+    let idx = crate::universe::build_index(&node);
+
+    let layouts: Option<LayoutMap> = match &spec.layout_path {
+        Some(p) => {
+            let text = std::fs::read_to_string(p)
+                .with_context(|| format!("reading layout dump {}", p.display()))?;
+            Some(crate::verify::parse_layouts(&text))
+        }
+        None => None,
+    };
+    let empty = LayoutMap::new();
+    let lay = layouts.as_ref().unwrap_or(&empty);
+
+    let closure = compute_closure(&module, &idx);
+    let occ = Occ {
+        ordinal: spec.cell.version.ordinal,
+        arch: spec.cell.arch,
+        surface: spec.cell.surface,
+    };
+
+    let enum_align: BTreeMap<String, u64> = closure
+        .enums
+        .values()
+        .filter_map(|e| e.name.clone().map(|n| (n, prim_size(enum_repr_of(e)) as u64)))
+        .collect();
+    let cx = AlignCtx {
+        layouts: lay,
+        records: &closure.records,
+        enum_align: &enum_align,
+        typedefs: &closure.typedefs,
+        ptr_bytes: spec.ptr_bytes,
+    };
+    let reprs = compute_reprs(&closure.records, &cx);
+
+    let mut refbuf: Vec<String> = Vec::new();
+    let sink = |st: &mut FoldState, key: &Key, buf: &mut Vec<String>| {
+        st.refs.entry(key.clone()).or_default().extend(buf.drain(..));
+    };
+
+    for (name, r) in &closure.records {
+        let key = Key { kind: Kind::Record, name: name.clone(), def_hash: r.definition_hash() };
+        st.occs.entry(key.clone()).or_default().insert(occ);
+        record_refs(r, &mut refbuf);
+        sink(st, &key, &mut refbuf);
+        if !st.rec_tokens.contains_key(&key) {
+            let repr = reprs.get(name).copied().unwrap_or(Repr::C);
+            st.rec_tokens.insert(key.clone(), emit_record(r, repr, &cx));
+            if append_checks
+                && let Some(chk) = crate::verify::record_check(name, r, lay, &mut st.stats)
+            {
+                st.rec_checks.insert(key.clone(), chk);
+            }
+        }
+    }
+    for e in closure.enums.values() {
+        let name = e.name.clone().unwrap_or_default();
+        let key = Key { kind: Kind::Enum, name, def_hash: e.definition_hash() };
+        st.occs.entry(key.clone()).or_default().insert(occ);
+        if let Some(u) = &e.underlying {
+            refs_of(&ctype::parse(u), &mut refbuf);
+            sink(st, &key, &mut refbuf);
+        }
+        st.enum_tokens.entry(key).or_insert_with(|| emit_enum(e));
+    }
+    for t in closure.typedefs.values() {
+        let key = Key { kind: Kind::Typedef, name: t.name.clone(), def_hash: t.definition_hash() };
+        st.occs.entry(key.clone()).or_default().insert(occ);
+        refs_of(&t.ty, &mut refbuf);
+        sink(st, &key, &mut refbuf);
+        if !st.typedef_tokens.contains_key(&key)
+            && let Some(tok) = emit_typedef(t)
+        {
+            st.typedef_tokens.insert(key, tok);
+        }
+    }
+    // Dedup functions by name within the cell (first decl wins), matching the
+    // single-cell extern-block emitter — two `pub fn X` in one config is an error.
+    let mut seen_fn: BTreeSet<&str> = BTreeSet::new();
+    for f in &module.functions {
+        if !seen_fn.insert(f.name.as_str()) {
+            continue;
+        }
+        let key = Key { kind: Kind::Function, name: f.name.clone(), def_hash: f.definition_hash() };
+        st.occs.entry(key.clone()).or_default().insert(occ);
+        refs_of(&f.ret, &mut refbuf);
+        for p in &f.params {
+            refs_of(&p.ty, &mut refbuf);
+        }
+        sink(st, &key, &mut refbuf);
+        let abi = match f.calling_conv {
+            CallingConv::Stdcall => "system",
+            _ => "C",
+        };
+        st.fn_tokens.entry(key).or_insert_with(|| (abi, emit_fn_decl(f)));
+    }
+    for name in &closure.opaque {
+        st.opaque_occs.entry(name.clone()).or_default().insert(occ);
+    }
+    Ok(())
+}
+
+/// Occurrence union by tag name over the *defined* kinds (record/enum/typedef) —
+/// the cells a given name is a real, emitted type in (any shape variant).
+fn defined_occs_by_name(occs: &BTreeMap<Key, BTreeSet<Occ>>) -> BTreeMap<String, BTreeSet<Occ>> {
+    let mut out: BTreeMap<String, BTreeSet<Occ>> = BTreeMap::new();
+    for (k, set) in occs {
+        if matches!(k.kind, Kind::Record | Kind::Enum | Kind::Typedef) {
+            out.entry(k.name.clone()).or_default().extend(set.iter().copied());
+        }
+    }
+    out
+}
+
+/// Build the opaque-stub items. An opaque name is emitted only for the cells where
+/// no real definition of that name exists (`opaque_occs − defined_occs`); a name
+/// opaque in every cell it appears (the common kernel-handle case) stays a single
+/// unconditional stub, while one that is opaque in some configs and defined in
+/// others emits both, on gate-disjoint `#[cfg]`s.
+fn assemble_opaque(
+    st: &FoldState,
+    defined_by_name: &BTreeMap<String, BTreeSet<Occ>>,
+    axis: &CapturedAxis,
+) -> Vec<TokenStream> {
+    let mut out = Vec::new();
+    for (name, opaque_occ) in &st.opaque_occs {
+        let remaining: BTreeSet<Occ> = match defined_by_name.get(name) {
+            Some(def) => opaque_occ.difference(def).copied().collect(),
+            None => opaque_occ.clone(),
+        };
+        if remaining.is_empty() {
+            continue; // a real definition covers every cell this name appears in
+        }
+        let pred = derive_gate(&remaining, axis).cfg_predicate(axis);
+        out.push(stamp_cfg(&pred, emit_opaque(name)));
+    }
+    out
+}
+
+/// Group the gated function decls into `unsafe extern "abi"` blocks (spec §4c: the
+/// AST-reported calling convention picks `"system"` vs `"C"`). Each decl carries
+/// its own `#[cfg]`, so an extern block may be empty under some feature set.
+fn assemble_functions(
+    st: &FoldState,
+    pred_of: &impl Fn(&BTreeSet<Occ>) -> Option<String>,
+) -> TokenStream {
+    let mut by_abi: BTreeMap<&str, Vec<TokenStream>> = BTreeMap::new();
+    for (key, (abi, decl)) in &st.fn_tokens {
+        let gated = stamp_cfg(&pred_of(&st.occs[key]), decl.clone());
+        by_abi.entry(abi).or_default().push(gated);
+    }
+    let blocks = by_abi.into_iter().map(|(abi, decls)| {
+        let abi_lit = proc_macro2::Literal::string(abi);
+        quote! {
+            unsafe extern #abi_lit {
+                #(#decls)*
+            }
+        }
+    });
+    quote! { #(#blocks)* }
+}
+
+/// Prefix a `#[cfg(pred)]` onto **each top-level item** in `group` (an enum expands
+/// to a type alias plus N consts, so a single leading attribute would gate only the
+/// first). `None` ⇒ unconditional, returned verbatim (and without a re-parse — the
+/// overwhelming majority of items are shared across all versions).
+fn stamp_cfg(pred: &Option<String>, group: TokenStream) -> TokenStream {
+    let Some(p) = pred else { return group };
+    let cfg_toks: TokenStream = p.parse().expect("cfg predicate is valid tokens");
+    let file = syn::parse2::<syn::File>(group).expect("emitted group is valid items");
+    let items = file.items.into_iter().map(|it| quote! { #[cfg(#cfg_toks)] #it });
+    quote! { #(#items)* }
+}
+
+/// Round-trip verification on real captured data (spec §8.4 — the primary
+/// regression net). For every captured cell, the compact per-variant gate must
+/// admit **exactly** the variants that occurred in that cell: `derive_gate(occs)`
+/// reproduces `occs` on the captured axis. An admits-but-didn't-occur mismatch is
+/// a phantom (a version gap or arch×version entanglement, spec §9) that the emitted
+/// `#[cfg]` would silently include; fail generation rather than ship it. (The
+/// synthetic version of this property lives in `merge`'s unit tests; this runs it
+/// against the actual merged universe.)
+fn check_round_trip(st: &FoldState, axis: &CapturedAxis) -> Result<()> {
+    let mut phantoms: Vec<String> = Vec::new();
+    for (key, occ_set) in &st.occs {
+        let gate = derive_gate(occ_set, axis);
+        for &cell in &axis.cells {
+            if gate.enables(cell) != occ_set.contains(&cell) {
+                phantoms.push(format!(
+                    "{:?} {} gate {}s cell {:?} but occurrence set disagrees",
+                    key.kind,
+                    key.name,
+                    if gate.enables(cell) { "admit" } else { "exclude" },
+                    cell,
+                ));
+                break;
+            }
+        }
+    }
+    if !phantoms.is_empty() {
+        let shown = phantoms.iter().take(10).cloned().collect::<Vec<_>>().join("\n  ");
+        bail!(
+            "§8.4 round-trip failed — {} variant(s) with a gate that misrepresents their \
+             occurrences:\n  {}",
+            phantoms.len(),
+            shown
+        );
+    }
+    Ok(())
+}
+
+/// Gate-closure verification (spec §4b(2)/§8.5). For every emitted item variant and
+/// every named type it references, the referent must exist in *every* cell the item
+/// occurs in (a real definition or an opaque stub; primitives are unconditional).
+/// Closure-level merging makes this hold by construction; a violation is a bug, so
+/// this fails generation with the offending edge rather than emitting a dangling
+/// reference (the `ntzwapi.h`-class failure §4b describes).
+fn check_gate_closure(
+    st: &FoldState,
+    defined_by_name: &BTreeMap<String, BTreeSet<Occ>>,
+) -> Result<()> {
+    let mut violations: Vec<String> = Vec::new();
+    for (key, refs) in &st.refs {
+        let item_occ = &st.occs[key];
+        for t in refs {
+            if well_known_prim(t).is_some() {
+                continue; // rendered inline as a concrete primitive — always present
+            }
+            let mut avail: BTreeSet<Occ> = BTreeSet::new();
+            if let Some(d) = defined_by_name.get(t) {
+                avail.extend(d.iter().copied());
+            }
+            if let Some(o) = st.opaque_occs.get(t) {
+                avail.extend(o.iter().copied());
+            }
+            if avail.is_empty() {
+                continue; // not a named emitted type (inline prim / void) — skip
+            }
+            let missing: Vec<Occ> = item_occ.difference(&avail).copied().collect();
+            if !missing.is_empty() {
+                violations.push(format!(
+                    "{:?} {} references `{t}` absent in {} of its cells (e.g. {:?})",
+                    key.kind,
+                    key.name,
+                    missing.len(),
+                    missing[0],
+                ));
+            }
+        }
+    }
+    if !violations.is_empty() {
+        let shown = violations.iter().take(10).cloned().collect::<Vec<_>>().join("\n  ");
+        bail!(
+            "gate closure violated (§4b(2)) — {} edge(s):\n  {}",
+            violations.len(),
+            shown
+        );
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -808,11 +1244,10 @@ fn emit_enum(e: &Enum) -> TokenStream {
 }
 
 fn enum_repr(e: &Enum, vals: &[(String, i128)]) -> Prim {
-    if let Some(u) = &e.underlying {
-        if let Some(p) = resolve_prim(&ctype::parse(u), &BTreeMap::new()) {
+    if let Some(u) = &e.underlying
+        && let Some(p) = resolve_prim(&ctype::parse(u), &BTreeMap::new()) {
             return p;
         }
-    }
     // Infer a fitting type (C enums are `int` unless values don't fit).
     let (mut min, mut max) = (0i128, 0i128);
     for (_, v) in vals {

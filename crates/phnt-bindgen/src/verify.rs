@@ -201,6 +201,76 @@ pub struct CheckStats {
     pub offset_checks: usize,
 }
 
+/// The compile-time layout assertions for **one** record, plus its check counts,
+/// or `None` when the record is not directly checkable (hoisted-anon, known-
+/// divergent, or absent from the layout dump). Factored out of
+/// [`emit_layout_checks`] so the merged emitter can gate each record's `const _`
+/// item behind that variant's `#[cfg(...)]` (spec §8.2 under the version lattice):
+/// a superseded record is only asserted in the configs where it exists.
+///
+/// `stats` accumulates the coverage tallies so both callers report the same way.
+pub fn record_check(
+    name: &str,
+    rec: &Record,
+    layouts: &LayoutMap,
+    stats: &mut CheckStats,
+) -> Option<TokenStream> {
+    // Hoisted anon records carry synthetic names clang never emits; their bytes
+    // are proven through the enclosing tag-named parent.
+    if rec.anon {
+        stats.anon_skipped += 1;
+        return None;
+    }
+    if let Some((_, why)) = KNOWN_LAYOUT_DIVERGENT.iter().find(|(n, _)| *n == name) {
+        stats.known_divergent += 1;
+        eprintln!("[phnt-bindgen] layout check skipped for {name}: {why}");
+        return None;
+    }
+    let Some(layout) = layouts.get(name) else {
+        stats.unmatched += 1;
+        return None;
+    };
+    stats.matched += 1;
+
+    let ty = format_ident!("{}", ctype::sanitize_ident(name));
+    let size = layout.size as usize;
+    let align = layout.align as usize;
+    let mut asserts: Vec<TokenStream> = Vec::new();
+    asserts.push(quote! { assert!(::core::mem::size_of::<#ty>() == #size); });
+    asserts.push(quote! { assert!(::core::mem::align_of::<#ty>() == #align); });
+    stats.size_checks += 1;
+
+    for f in &rec.fields {
+        if f.bitfield_width.is_some() {
+            continue; // coalesced into a `_bitfield_N` storage unit — no 1:1 field
+        }
+        let Some(fname) = &f.name else { continue };
+        let Some(off) = layout.fields.get(fname) else { continue };
+        let fi = format_ident!("{}", ctype::sanitize_ident(fname));
+        let off = *off as usize;
+        asserts.push(quote! { assert!(::core::mem::offset_of!(#ty, #fi) == #off); });
+        stats.offset_checks += 1;
+    }
+    Some(quote! { const _: () = { #(#asserts)* }; })
+}
+
+/// Wrap a set of already-emitted `const _` check items in the `#[cfg(test)] mod
+/// _layout_checks { … }` shell. Used by the merged emitter, which produces each
+/// item (gated) itself.
+pub fn wrap_layout_checks(items: Vec<TokenStream>) -> TokenStream {
+    quote! {
+        /// Compile-time layout parity assertions against clang's record-layout dump
+        /// (ground truth). Frozen numbers ⇒ no clang/SDK needed to re-verify; run
+        /// with `cargo test`. `cfg(test)` keeps consumer builds free of the checks.
+        #[cfg(test)]
+        mod _layout_checks {
+            #[allow(unused_imports)]
+            use super::*;
+            #(#items)*
+        }
+    }
+}
+
 /// Emit the `#[cfg(test)] mod _layout_checks { … }` compile-time assertions for
 /// every emitted record that clang measured, and report coverage stats.
 pub fn emit_layout_checks(
@@ -211,57 +281,12 @@ pub fn emit_layout_checks(
     let mut items: Vec<TokenStream> = Vec::new();
 
     for (name, rec) in records {
-        // Hoisted anon records carry synthetic names clang never emits; their bytes
-        // are proven through the enclosing tag-named parent.
-        if rec.anon {
-            stats.anon_skipped += 1;
-            continue;
+        if let Some(item) = record_check(name, rec, layouts, &mut stats) {
+            items.push(item);
         }
-        if let Some((_, why)) = KNOWN_LAYOUT_DIVERGENT.iter().find(|(n, _)| n == name) {
-            stats.known_divergent += 1;
-            eprintln!("[phnt-bindgen] layout check skipped for {name}: {why}");
-            continue;
-        }
-        let Some(layout) = layouts.get(name) else {
-            stats.unmatched += 1;
-            continue;
-        };
-        stats.matched += 1;
-
-        let ty = format_ident!("{}", ctype::sanitize_ident(name));
-        let size = layout.size as usize;
-        let align = layout.align as usize;
-        let mut asserts: Vec<TokenStream> = Vec::new();
-        asserts.push(quote! { assert!(::core::mem::size_of::<#ty>() == #size); });
-        asserts.push(quote! { assert!(::core::mem::align_of::<#ty>() == #align); });
-        stats.size_checks += 1;
-
-        for f in &rec.fields {
-            if f.bitfield_width.is_some() {
-                continue; // coalesced into a `_bitfield_N` storage unit — no 1:1 field
-            }
-            let Some(fname) = &f.name else { continue };
-            let Some(off) = layout.fields.get(fname) else { continue };
-            let fi = format_ident!("{}", ctype::sanitize_ident(fname));
-            let off = *off as usize;
-            asserts.push(quote! { assert!(::core::mem::offset_of!(#ty, #fi) == #off); });
-            stats.offset_checks += 1;
-        }
-        items.push(quote! { const _: () = { #(#asserts)* }; });
     }
 
-    let module = quote! {
-        /// Compile-time layout parity assertions against clang's record-layout dump
-        /// (ground truth). Frozen numbers ⇒ no clang/SDK needed to re-verify; run
-        /// with `cargo test`. `cfg(test)` keeps consumer builds free of the checks.
-        #[cfg(test)]
-        mod _layout_checks {
-            #[allow(unused_imports)]
-            use super::*;
-            #(#items)*
-        }
-    };
-    (module, stats)
+    (wrap_layout_checks(items), stats)
 }
 
 #[cfg(test)]

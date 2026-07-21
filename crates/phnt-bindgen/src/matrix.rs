@@ -170,6 +170,45 @@ pub fn feature_for_ordinal(ordinal: u32) -> &'static str {
         .unwrap_or_else(|| floor().feature)
 }
 
+/// Render the Cargo `[features]` implication chain (spec §4a) for the emitted
+/// crate. Every threshold at or above the Win10 floor enables the one below it, so
+/// a consumer selects a single `winNN` feature and inherits every older gate via
+/// the chain — which is exactly what lets a `cfg_predicate` open up-set carry only
+/// its lower `feature = "winNN"` bound. Pre-Win10 thresholds form their own chain
+/// gated behind an off-by-default `legacy` feature (tier-3 `win7` / `no_std`
+/// audiences; §4a(2)). Deterministic text so regen diffs stay minimal.
+pub fn feature_chain_toml() -> String {
+    let mut out = String::from("[features]\n");
+    out.push_str("default = [\"win10\"]\n\n");
+
+    out.push_str("# Windows 10+ threshold chain (spec §4a): each release enables the previous,\n");
+    out.push_str("# so selecting one feature inherits every older gate.\n");
+    let mut prev: Option<&str> = None;
+    for v in VERSIONS.iter().filter(|v| v.ordinal >= FLOOR_ORDINAL) {
+        match prev {
+            Some(p) => out.push_str(&format!("{} = [\"{}\"]\n", v.feature, p)),
+            None => out.push_str(&format!("{} = []\n", v.feature)),
+        }
+        prev = Some(v.feature);
+    }
+
+    let sub_floor: Vec<&Version> = VERSIONS.iter().filter(|v| v.ordinal < FLOOR_ORDINAL).collect();
+    if let Some(top) = sub_floor.last() {
+        out.push('\n');
+        out.push_str("# Pre-Win10 thresholds — opt-in via `legacy` (tier-3 win7 / no_std, §4a(2)).\n");
+        out.push_str(&format!("legacy = [\"win10\", \"{}\"]\n", top.feature));
+        let mut prev: Option<&str> = None;
+        for v in &sub_floor {
+            match prev {
+                Some(p) => out.push_str(&format!("{} = [\"{}\"]\n", v.feature, p)),
+                None => out.push_str(&format!("{} = []\n", v.feature)),
+            }
+            prev = Some(v.feature);
+        }
+    }
+    out
+}
+
 /// One cell of the config matrix: a single clang invocation's worth of config.
 #[derive(Copy, Clone, PartialEq, Eq, Hash, Debug)]
 pub struct Cell {
@@ -196,5 +235,29 @@ impl Cell {
 impl fmt::Display for Cell {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{}", self.label())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn feature_chain_links_each_release_to_the_previous() {
+        let toml = feature_chain_toml();
+        // Floor is the base of the chain (enables nothing).
+        assert!(toml.contains("win10 = []"), "{toml}");
+        // Win11 rides the chain through the last Win10 threshold, not straight to win10.
+        assert!(toml.contains("win11 = [\"win10_22h2\"]"), "{toml}");
+        assert!(toml.contains("win10_th2 = [\"win10\"]"), "{toml}");
+        // Pre-floor gates are opt-in behind `legacy`, and chained among themselves.
+        assert!(toml.contains("legacy = [\"win10\", \"win81\"]"), "{toml}");
+        assert!(toml.contains("winxp = []"), "{toml}");
+        assert!(toml.contains("win7 = [\"vista\"]"), "{toml}");
+        // Every emitted version appears exactly once as a chain entry key.
+        for v in VERSIONS {
+            let key = format!("\n{} = [", v.feature);
+            assert_eq!(toml.matches(&key).count(), 1, "feature {} not unique", v.feature);
+        }
     }
 }
