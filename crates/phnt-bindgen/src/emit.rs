@@ -25,7 +25,7 @@ use quote::{format_ident, quote};
 use crate::ctype::{self, CType, Prim};
 use crate::ir::{CallingConv, Enum, Function, Module, Record, Typedef};
 use crate::matrix::Cell;
-use crate::merge::{CapturedAxis, Key, Kind, Occ, derive_gate};
+use crate::merge::{CapturedAxis, Key, Kind, Occ, arch_grouped_predicates, derive_gate};
 use crate::universe::Index;
 use crate::verify::{CheckStats, LayoutMap};
 
@@ -87,7 +87,8 @@ pub fn emit(
 // ---------------------------------------------------------------------------
 
 /// One matrix cell's on-disk inputs for [`emit_merged`]. Files are parsed lazily
-/// inside the fold so only one ~300 MB AST is resident at a time.
+/// inside the fold so only one ~300 MB AST is resident at a time. Cells may span
+/// arches *and* versions; `ptr_bytes` + the per-cell layout dump carry the arch.
 pub struct CellSpec {
     pub cell: Cell,
     pub ast_path: PathBuf,
@@ -98,29 +99,69 @@ pub struct CellSpec {
     pub ptr_bytes: u64,
 }
 
-/// The accumulated, rendered-once-per-variant state folded across all cells.
-/// Everything is keyed by [`Key`] `(kind, name, definition_hash)` so a same-named
-/// item whose shape changed between versions splits into gate-disjoint variants.
+/// A group of emitted items deduplicated by their **rendered token text**, each
+/// mapped to the exact matrix cells that produced that rendering. Emission is keyed
+/// by rendering, not by `def_hash`, because that is what a `#[cfg]` must gate:
+/// - a shape-identical type can render *differently across arches* (`#[repr]`/
+///   padding driven by pointer width; `ULONG_PTR = u64` on x64/arm64 vs `u32` on
+///   x86) — each rendering is gated to the arches that produced it;
+/// - a version shape change already renders differently (distinct tokens);
+/// - the shallow-`definition_hash` over-fold (field type *names*, not transitive
+///   shapes) also splits here, since the divergent layout renders divergent tokens.
+///
+/// The map key is `(tag name, token string)`: the name leads so output stays
+/// name-ordered and per-name variants sit adjacent; the token string dedups.
+#[derive(Default)]
+struct RenderGroup {
+    items: BTreeMap<(String, String), (TokenStream, BTreeSet<Occ>)>,
+}
+
+impl RenderGroup {
+    fn add(&mut self, name: &str, tokens: TokenStream, occ: Occ) {
+        self.items
+            .entry((name.to_string(), tokens.to_string()))
+            .or_insert_with(|| (tokens, BTreeSet::new()))
+            .1
+            .insert(occ);
+    }
+
+    /// Emit every rendering. A rendering that is arch×version-entangled yields more
+    /// than one gate-disjoint copy (see [`arch_grouped_predicates`]); arch-uniform
+    /// ones yield a single gated copy.
+    fn assemble(&self, axis: &CapturedAxis) -> Vec<TokenStream> {
+        let mut out = Vec::new();
+        for (tokens, occs) in self.items.values() {
+            for pred in arch_grouped_predicates(occs, axis) {
+                out.push(stamp_cfg(&pred, tokens.clone()));
+            }
+        }
+        out
+    }
+}
+
+/// The state folded across all cells. `occs`/`refs` are keyed by [`Key`]
+/// `(kind, name, definition_hash)` for the name-level §8.4/§8.5 checks; the
+/// [`RenderGroup`]s carry the actual gate-disjoint emissions (see its docs).
 #[derive(Default)]
 struct FoldState {
     occs: BTreeMap<Key, BTreeSet<Occ>>,
     refs: BTreeMap<Key, BTreeSet<String>>,
-    /// Records need per-cell context (`#[repr]`, padding, layout), so they are
-    /// rendered in the first cell a variant is seen in; enums/typedefs/functions
-    /// render context-free from any occurrence.
-    rec_tokens: BTreeMap<Key, TokenStream>,
-    rec_checks: BTreeMap<Key, TokenStream>,
-    enum_tokens: BTreeMap<Key, TokenStream>,
-    typedef_tokens: BTreeMap<Key, TokenStream>,
-    /// `(abi, decl)` — abi groups the extern block, decl is gated inside it.
-    fn_tokens: BTreeMap<Key, (&'static str, TokenStream)>,
+    records: RenderGroup,
+    checks: RenderGroup,
+    enums: RenderGroup,
+    typedefs: RenderGroup,
+    /// Functions additionally carry their ABI (which groups the extern block).
+    functions: BTreeMap<(String, String), (&'static str, TokenStream, BTreeSet<Occ>)>,
     opaque_occs: BTreeMap<String, BTreeSet<Occ>>,
-    stats: CheckStats,
 }
 
 /// Emit one self-contained, `#[cfg]`-gated Rust `ffi` source folding every cell in
-/// `cells` (which must share an arch; the version axis is what gates). When
-/// `append_checks`, a per-variant-gated `#[cfg(test)] mod _layout_checks` is added.
+/// `cells`, across **both** the version axis (`feature = "winNN"`) and the arch axis
+/// (`target_arch`). Each item is deduplicated by its rendered token text and gated to
+/// the exact cells that produced that rendering (see [`RenderGroup`]), so a type that
+/// renders differently per arch (pointer-width-driven `#[repr]`/typedefs) splits into
+/// gate-disjoint per-arch renderings. When `append_checks`, a per-rendering-gated
+/// `#[cfg(test)] mod _layout_checks` is added (each arch asserts its own numbers).
 ///
 /// The §8.4 round-trip (`filter(merged, cell) == cell`) and §8.5 gate closure are
 /// both enforced here: closure membership is what the occurrence sets encode, and
@@ -161,45 +202,24 @@ pub fn emit_merged(cells: &[CellSpec], append_checks: bool) -> Result<String> {
     check_round_trip(&st, &axis)?;
     check_gate_closure(&st, &defined_by_name)?;
 
-    // A gate → `#[cfg(...)]` predicate for an occurrence set.
-    let pred_of = |set: &BTreeSet<Occ>| derive_gate(set, &axis).cfg_predicate(&axis);
-
     // --- assemble each section (opaque, typedefs, enums, records, funcs) --------
     let opaque = assemble_opaque(&st, &defined_by_name, &axis);
-
-    let typedefs = st
-        .typedef_tokens
-        .iter()
-        .map(|(k, t)| stamp_cfg(&pred_of(&st.occs[k]), t.clone()))
-        .collect::<Vec<_>>();
-    let enums = st
-        .enum_tokens
-        .iter()
-        .map(|(k, e)| stamp_cfg(&pred_of(&st.occs[k]), e.clone()))
-        .collect::<Vec<_>>();
-    let records = st
-        .rec_tokens
-        .iter()
-        .map(|(k, r)| stamp_cfg(&pred_of(&st.occs[k]), r.clone()))
-        .collect::<Vec<_>>();
-    let funcs = assemble_functions(&st, &pred_of);
+    let typedefs = st.typedefs.assemble(&axis);
+    let enums = st.enums.assemble(&axis);
+    let records = st.records.assemble(&axis);
+    let funcs = assemble_functions(&st, &axis);
 
     let checks = if append_checks {
-        let items = st
-            .rec_checks
-            .iter()
-            .map(|(k, c)| stamp_cfg(&pred_of(&st.occs[k]), c.clone()))
-            .collect::<Vec<_>>();
+        let items = st.checks.assemble(&axis);
+        let check_names: BTreeSet<&str> =
+            st.checks.items.keys().map(|(n, _)| n.as_str()).collect();
         eprintln!(
-            "[phnt-bindgen] merged layout parity: {} records matched, {} unmatched, {} anon skipped, \
-             {} known-divergent; {} size+align, {} offset asserts (gated across {} versions)",
-            st.stats.matched,
-            st.stats.unmatched,
-            st.stats.anon_skipped,
-            st.stats.known_divergent,
-            st.stats.size_checks,
-            st.stats.offset_checks,
+            "[phnt-bindgen] merged layout parity: {} records checked, {} check renderings \
+             (arch/version-split), gated across {} version(s) × {} arch(es)",
+            check_names.len(),
+            items.len(),
             axis.versions.len(),
+            axis.arches.len(),
         );
         crate::verify::wrap_layout_checks(items)
     } else {
@@ -207,14 +227,15 @@ pub fn emit_merged(cells: &[CellSpec], append_checks: bool) -> Result<String> {
     };
 
     eprintln!(
-        "[phnt-bindgen] merged: {} record variants, {} enums, {} typedefs, {} fns, {} opaque; \
-         versions {:?}",
-        st.rec_tokens.len(),
-        st.enum_tokens.len(),
-        st.typedef_tokens.len(),
-        st.fn_tokens.len(),
+        "[phnt-bindgen] merged: {} record renderings, {} enums, {} typedefs, {} fns, {} opaque; \
+         versions {:?}, arches {:?}",
+        records.len(),
+        enums.len(),
+        typedefs.len(),
+        st.functions.len(),
         opaque.len(),
         axis.versions,
+        axis.arches.iter().map(|a| a.rust_arch()).collect::<Vec<_>>(),
     );
 
     let tokens = quote! {
@@ -282,40 +303,37 @@ fn fold_cell(spec: &CellSpec, append_checks: bool, st: &mut FoldState) -> Result
         st.refs.entry(key.clone()).or_default().extend(buf.drain(..));
     };
 
+    let mut scratch = CheckStats::default(); // per-cell tallies; reporting uses render groups
     for (name, r) in &closure.records {
         let key = Key { kind: Kind::Record, name: name.clone(), def_hash: r.definition_hash() };
         st.occs.entry(key.clone()).or_default().insert(occ);
         record_refs(r, &mut refbuf);
         sink(st, &key, &mut refbuf);
-        if !st.rec_tokens.contains_key(&key) {
-            let repr = reprs.get(name).copied().unwrap_or(Repr::C);
-            st.rec_tokens.insert(key.clone(), emit_record(r, repr, &cx));
-            if append_checks
-                && let Some(chk) = crate::verify::record_check(name, r, lay, &mut st.stats)
-            {
-                st.rec_checks.insert(key.clone(), chk);
-            }
+        let repr = reprs.get(name).copied().unwrap_or(Repr::C);
+        st.records.add(name, emit_record(r, repr, &cx), occ);
+        if append_checks
+            && let Some(chk) = crate::verify::record_check(name, r, lay, &mut scratch)
+        {
+            st.checks.add(name, chk, occ);
         }
     }
     for e in closure.enums.values() {
         let name = e.name.clone().unwrap_or_default();
-        let key = Key { kind: Kind::Enum, name, def_hash: e.definition_hash() };
+        let key = Key { kind: Kind::Enum, name: name.clone(), def_hash: e.definition_hash() };
         st.occs.entry(key.clone()).or_default().insert(occ);
         if let Some(u) = &e.underlying {
             refs_of(&ctype::parse(u), &mut refbuf);
             sink(st, &key, &mut refbuf);
         }
-        st.enum_tokens.entry(key).or_insert_with(|| emit_enum(e));
+        st.enums.add(&name, emit_enum(e), occ);
     }
     for t in closure.typedefs.values() {
         let key = Key { kind: Kind::Typedef, name: t.name.clone(), def_hash: t.definition_hash() };
         st.occs.entry(key.clone()).or_default().insert(occ);
         refs_of(&t.ty, &mut refbuf);
         sink(st, &key, &mut refbuf);
-        if !st.typedef_tokens.contains_key(&key)
-            && let Some(tok) = emit_typedef(t)
-        {
-            st.typedef_tokens.insert(key, tok);
+        if let Some(tok) = emit_typedef(t) {
+            st.typedefs.add(&t.name, tok, occ);
         }
     }
     // Dedup functions by name within the cell (first decl wins), matching the
@@ -336,7 +354,12 @@ fn fold_cell(spec: &CellSpec, append_checks: bool, st: &mut FoldState) -> Result
             CallingConv::Stdcall => "system",
             _ => "C",
         };
-        st.fn_tokens.entry(key).or_insert_with(|| (abi, emit_fn_decl(f)));
+        let decl = emit_fn_decl(f);
+        st.functions
+            .entry((f.name.clone(), decl.to_string()))
+            .or_insert_with(|| (abi, decl, BTreeSet::new()))
+            .2
+            .insert(occ);
     }
     for name in &closure.opaque {
         st.opaque_occs.entry(name.clone()).or_default().insert(occ);
@@ -375,23 +398,23 @@ fn assemble_opaque(
         if remaining.is_empty() {
             continue; // a real definition covers every cell this name appears in
         }
-        let pred = derive_gate(&remaining, axis).cfg_predicate(axis);
-        out.push(stamp_cfg(&pred, emit_opaque(name)));
+        for pred in arch_grouped_predicates(&remaining, axis) {
+            out.push(stamp_cfg(&pred, emit_opaque(name)));
+        }
     }
     out
 }
 
 /// Group the gated function decls into `unsafe extern "abi"` blocks (spec §4c: the
 /// AST-reported calling convention picks `"system"` vs `"C"`). Each decl carries
-/// its own `#[cfg]`, so an extern block may be empty under some feature set.
-fn assemble_functions(
-    st: &FoldState,
-    pred_of: &impl Fn(&BTreeSet<Occ>) -> Option<String>,
-) -> TokenStream {
+/// its own `#[cfg]` (from its rendering's producing cells), so an extern block may
+/// be empty under some feature set.
+fn assemble_functions(st: &FoldState, axis: &CapturedAxis) -> TokenStream {
     let mut by_abi: BTreeMap<&str, Vec<TokenStream>> = BTreeMap::new();
-    for (key, (abi, decl)) in &st.fn_tokens {
-        let gated = stamp_cfg(&pred_of(&st.occs[key]), decl.clone());
-        by_abi.entry(abi).or_default().push(gated);
+    for (abi, decl, occs) in st.functions.values() {
+        for pred in arch_grouped_predicates(occs, axis) {
+            by_abi.entry(abi).or_default().push(stamp_cfg(&pred, decl.clone()));
+        }
     }
     let blocks = by_abi.into_iter().map(|(abi, decls)| {
         let abi_lit = proc_macro2::Literal::string(abi);
@@ -417,35 +440,45 @@ fn stamp_cfg(pred: &Option<String>, group: TokenStream) -> TokenStream {
 }
 
 /// Round-trip verification on real captured data (spec §8.4 — the primary
-/// regression net). For every captured cell, the compact per-variant gate must
-/// admit **exactly** the variants that occurred in that cell: `derive_gate(occs)`
-/// reproduces `occs` on the captured axis. An admits-but-didn't-occur mismatch is
-/// a phantom (a version gap or arch×version entanglement, spec §9) that the emitted
-/// `#[cfg]` would silently include; fail generation rather than ship it. (The
-/// synthetic version of this property lives in `merge`'s unit tests; this runs it
-/// against the actual merged universe.)
+/// regression net). For every captured cell, the compact gate must admit **exactly**
+/// the cells its item occurred in: `derive_gate(occs)` reproduces `occs` on the
+/// captured axis. An admits-but-didn't-occur mismatch is a phantom (a version gap or
+/// arch×version entanglement, spec §9) the emitted `#[cfg]` would silently include.
+///
+/// Checked at **two granularities**: the name-level `(kind,name,def_hash)` occurrence
+/// sets (the spec §8.4 property — item-set membership per config) *and* every
+/// [`RenderGroup`] rendering's occurrence set (emission faithfulness — it is the
+/// rendering that actually gets a `cfg`, and a rendering split across arch×version
+/// need not be a clean rectangle). Either failing bails generation. (The synthetic
+/// form of this property lives in `merge`'s unit tests.)
 fn check_round_trip(st: &FoldState, axis: &CapturedAxis) -> Result<()> {
     let mut phantoms: Vec<String> = Vec::new();
-    for (key, occ_set) in &st.occs {
+    let mut check = |label: String, occ_set: &BTreeSet<Occ>| {
         let gate = derive_gate(occ_set, axis);
-        for &cell in &axis.cells {
-            if gate.enables(cell) != occ_set.contains(&cell) {
-                phantoms.push(format!(
-                    "{:?} {} gate {}s cell {:?} but occurrence set disagrees",
-                    key.kind,
-                    key.name,
-                    if gate.enables(cell) { "admit" } else { "exclude" },
-                    cell,
-                ));
-                break;
-            }
+        if let Some(cell) = axis.cells.iter().find(|&&c| gate.enables(c) != occ_set.contains(&c)) {
+            phantoms.push(format!(
+                "{label}: gate {}s cell {:?} but occurrence set disagrees",
+                if gate.enables(*cell) { "admit" } else { "exclude" },
+                cell,
+            ));
         }
+    };
+    for (key, occ_set) in &st.occs {
+        check(format!("{:?} {}", key.kind, key.name), occ_set);
+    }
+    for group in [&st.records, &st.checks, &st.enums, &st.typedefs] {
+        for ((name, _), (_, occ_set)) in &group.items {
+            check(format!("rendering of {name}"), occ_set);
+        }
+    }
+    for ((name, _), (_, _, occ_set)) in &st.functions {
+        check(format!("fn rendering of {name}"), occ_set);
     }
     if !phantoms.is_empty() {
         let shown = phantoms.iter().take(10).cloned().collect::<Vec<_>>().join("\n  ");
         bail!(
-            "§8.4 round-trip failed — {} variant(s) with a gate that misrepresents their \
-             occurrences:\n  {}",
+            "§8.4 round-trip failed — {} item(s)/rendering(s) with a gate that misrepresents \
+             their occurrences:\n  {}",
             phantoms.len(),
             shown
         );

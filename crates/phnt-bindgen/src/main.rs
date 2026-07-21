@@ -46,9 +46,11 @@ struct GenerateMergedArgs {
     #[arg(long = "version", value_delimiter = ',', default_values = ["win10", "win11"])]
     versions: Vec<String>,
 
-    /// Target architecture — must match the captured cells (all share one arch).
-    #[arg(long, value_enum, default_value_t = ArchArg::X64)]
-    arch: ArchArg,
+    /// Target architectures to merge (repeat `--arch` or comma-separate). Cells are
+    /// the cartesian product versions × arches; uncaptured cells are skipped with a
+    /// warning. Arch-structural differences become `#[cfg(target_arch)]` gates.
+    #[arg(long = "arch", value_enum, value_delimiter = ',', default_values_t = [ArchArg::X64])]
+    arches: Vec<ArchArg>,
 
     /// Where to write the merged `.rs`. Defaults to `target/phnt-gen/ffi-merged.rs`.
     #[arg(long)]
@@ -272,14 +274,12 @@ fn run_generate(root: &std::path::Path, args: GenerateArgs) -> Result<()> {
 }
 
 fn run_generate_merged(root: &std::path::Path, args: GenerateMergedArgs) -> Result<()> {
-    let arch: Arch = args.arch.into();
-    let ptr_bytes = (arch.pointer_width() / 8) as u64;
     let artifact_dir = root.join("target").join("phnt-ast");
 
-    // Resolve each version to its captured AST (+ optional layout dump) by the
-    // artifact naming convention. Ascending order makes the oldest cell the
-    // representative for shared variants (least churn vs the single-cell output).
-    let mut specs: Vec<phnt_bindgen::emit::CellSpec> = Vec::new();
+    // Resolve versions (ascending, deduped) and arches into the cartesian product of
+    // matrix cells. Uncaptured cells are skipped with a warning rather than failing,
+    // so a partially-captured matrix (e.g. all arches at win10, only x64 at win11)
+    // still merges everything on hand — the §8.4 round-trip only spans captured cells.
     let mut versions: Vec<matrix::Version> = args
         .versions
         .iter()
@@ -287,24 +287,36 @@ fn run_generate_merged(root: &std::path::Path, args: GenerateMergedArgs) -> Resu
         .collect::<Result<_>>()?;
     versions.sort_by_key(|v| v.ordinal);
     versions.dedup_by_key(|v| v.ordinal);
+    let mut arches: Vec<Arch> = args.arches.iter().map(|a| Arch::from(*a)).collect();
+    arches.sort();
+    arches.dedup();
 
-    for version in versions {
-        let cell = Cell::new(version, arch, Surface::User);
-        let ast = artifact_dir.join(format!("{}.json", cell.label()));
-        if !ast.exists() {
-            bail!(
-                "missing AST for {cell}: {}\n  capture it with: phnt-bindgen ast --version {} --arch {}",
-                ast.display(),
-                version.feature,
-                arch.rust_arch(),
-            );
+    let mut specs: Vec<phnt_bindgen::emit::CellSpec> = Vec::new();
+    for version in &versions {
+        for &arch in &arches {
+            let ptr_bytes = (arch.pointer_width() / 8) as u64;
+            let cell = Cell::new(*version, arch, Surface::User);
+            let ast = artifact_dir.join(format!("{}.json", cell.label()));
+            if !ast.exists() {
+                eprintln!(
+                    "[phnt-bindgen] skipping uncaptured cell {cell} (no {}); capture: \
+                     phnt-bindgen ast --version {} --arch {}",
+                    ast.display(),
+                    version.feature,
+                    arch.rust_arch(),
+                );
+                continue;
+            }
+            let layout = ast.with_extension("layouts.txt");
+            let layout_path = layout.exists().then_some(layout);
+            specs.push(phnt_bindgen::emit::CellSpec { cell, ast_path: ast, layout_path, ptr_bytes });
         }
-        let layout = ast.with_extension("layouts.txt");
-        let layout_path = layout.exists().then_some(layout);
-        specs.push(phnt_bindgen::emit::CellSpec { cell, ast_path: ast, layout_path, ptr_bytes });
+    }
+    if specs.is_empty() {
+        bail!("no captured cells for the requested versions × arches");
     }
 
-    eprintln!("[phnt-bindgen] merging {} cell(s) for {}", specs.len(), arch.rust_arch());
+    eprintln!("[phnt-bindgen] merging {} cell(s)", specs.len());
     let src = phnt_bindgen::emit::emit_merged(&specs, !args.no_checks)?;
 
     let out = args

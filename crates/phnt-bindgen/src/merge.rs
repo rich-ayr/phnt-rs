@@ -203,6 +203,36 @@ impl CapturedAxis {
     pub fn max_version(&self) -> Option<u32> {
         self.versions.iter().copied().next_back()
     }
+
+    /// The newest version captured among cells whose arch **and** surface a gate
+    /// spans. This is what the open-vs-bounded decision must compare against — NOT
+    /// the global newest — so a partially-captured matrix doesn't mis-bound. Example:
+    /// win11 captured only for x64 ⇒ an x86-only variant that reaches win10 (x86's
+    /// newest capture) is **open**, not "superseded by win11"; otherwise it would be
+    /// gated `not(feature="win11")` and vanish on a legitimate (x86, win11) build.
+    fn max_version_over(&self, arches: &BTreeSet<Arch>, surfaces: &BTreeSet<Surface>) -> Option<u32> {
+        self.cells
+            .iter()
+            .filter(|c| arches.contains(&c.arch) && surfaces.contains(&c.surface))
+            .map(|c| c.ordinal)
+            .max()
+    }
+
+    /// The oldest version captured *after* `after` among cells the gate's arch+surface
+    /// span — the feature whose selection should gate a bounded variant off (per-arch,
+    /// for the same partial-capture reason as [`max_version_over`]).
+    fn next_version_over(
+        &self,
+        arches: &BTreeSet<Arch>,
+        surfaces: &BTreeSet<Surface>,
+        after: u32,
+    ) -> Option<u32> {
+        self.cells
+            .iter()
+            .filter(|c| arches.contains(&c.arch) && surfaces.contains(&c.surface) && c.ordinal > after)
+            .map(|c| c.ordinal)
+            .min()
+    }
 }
 
 /// A variant's emitted existence predicate, derived from its occurrences.
@@ -260,10 +290,10 @@ impl Gate {
         if emit_min > crate::matrix::FLOOR_ORDINAL {
             parts.push(format!("feature = \"{}\"", crate::matrix::feature_for_ordinal(emit_min)));
         }
-        // A bounded variant stops below the newest captured version; gate it off
-        // once the next *captured* version's feature is enabled.
+        // A bounded variant stops below its arch's newest captured version; gate it
+        // off once the next version *captured for that arch* is enabled.
         if let Some(max) = self.max_ordinal
-            && let Some(&next) = axis.versions.iter().find(|&&o| o > max)
+            && let Some(next) = axis.next_version_over(&self.arches, &self.surfaces, max)
         {
             parts.push(format!("not(feature = \"{}\")", crate::matrix::feature_for_ordinal(next)));
         }
@@ -282,19 +312,82 @@ impl Gate {
     }
 }
 
+/// The version-only cfg parts (lower `feature` bound + arch-local supersession upper
+/// bound) for a set of occurrences that all share **one** arch. No `target_arch` —
+/// [`arch_grouped_predicates`] adds it after grouping arches that share these parts.
+fn version_parts(occs_one_arch: &BTreeSet<Occ>, axis: &CapturedAxis) -> Vec<String> {
+    let arches: BTreeSet<Arch> = occs_one_arch.iter().map(|o| o.arch).collect();
+    let surfaces: BTreeSet<Surface> = occs_one_arch.iter().map(|o| o.surface).collect();
+    let min = occs_one_arch.iter().map(|o| o.ordinal).min().unwrap_or(0);
+    let max_occ = occs_one_arch.iter().map(|o| o.ordinal).max().unwrap_or(0);
+
+    let mut parts = Vec::new();
+    let emit_min = min.max(crate::matrix::FLOOR_ORDINAL);
+    if emit_min > crate::matrix::FLOOR_ORDINAL {
+        parts.push(format!("feature = \"{}\"", crate::matrix::feature_for_ordinal(emit_min)));
+    }
+    // Bounded on this arch iff it stops below the newest version captured *for this
+    // arch* (partial-capture safe, see `max_version_over`); gate off at that arch's
+    // next captured version.
+    if Some(max_occ) != axis.max_version_over(&arches, &surfaces)
+        && let Some(next) = axis.next_version_over(&arches, &surfaces, max_occ)
+    {
+        parts.push(format!("not(feature = \"{}\")", crate::matrix::feature_for_ordinal(next)));
+    }
+    parts
+}
+
+/// Compile an occurrence set to **one or more** `#[cfg(...)]` predicates — one per
+/// group of arches that share the same version predicate. This is the correct
+/// emission for arch×version *entanglement* (spec §9): a shape superseded on one
+/// arch but still current on another (because that arch's newer version was never
+/// captured) can't be a single version-interval × arch-set rectangle, so it splits
+/// into gate-disjoint copies (e.g. one `all(not(feature="win11"), target_arch=
+/// "x86_64")` copy alongside an `any(target_arch="x86", target_arch="aarch64")`
+/// copy). Arch-uniform items yield a single predicate (no bloat), identical to
+/// [`Gate::cfg_predicate`].
+pub fn arch_grouped_predicates(occs: &BTreeSet<Occ>, axis: &CapturedAxis) -> Vec<Option<String>> {
+    let arches: BTreeSet<Arch> = occs.iter().map(|o| o.arch).collect();
+    // Group arches by their (identical) version predicate.
+    let mut groups: BTreeMap<Vec<String>, BTreeSet<Arch>> = BTreeMap::new();
+    for &a in &arches {
+        let per: BTreeSet<Occ> = occs.iter().copied().filter(|o| o.arch == a).collect();
+        groups.entry(version_parts(&per, axis)).or_default().insert(a);
+    }
+    groups
+        .into_iter()
+        .map(|(vparts, garches)| {
+            let mut parts = vparts;
+            if garches != axis.arches {
+                let mut a: Vec<String> = garches
+                    .iter()
+                    .map(|ar| format!("target_arch = \"{}\"", ar.rust_arch()))
+                    .collect();
+                parts.push(if a.len() == 1 { a.remove(0) } else { format!("any({})", a.join(", ")) });
+            }
+            match parts.len() {
+                0 => None,
+                1 => Some(parts.remove(0)),
+                _ => Some(format!("all({})", parts.join(", "))),
+            }
+        })
+        .collect()
+}
+
 /// Derive the compact [`Gate`] for an occurrence set. `max_ordinal` is left open
 /// (`None`) when the variant reaches the newest captured version, else bounded to
 /// its own last occurrence (a later shape-variant supersedes it above that).
 pub fn derive_gate(occs: &BTreeSet<Occ>, axis: &CapturedAxis) -> Gate {
     let min_ordinal = occs.iter().map(|o| o.ordinal).min().unwrap_or(0);
     let max_occ = occs.iter().map(|o| o.ordinal).max().unwrap_or(0);
-    let max_ordinal = if Some(max_occ) == axis.max_version() { None } else { Some(max_occ) };
-    Gate {
-        min_ordinal,
-        max_ordinal,
-        arches: occs.iter().map(|o| o.arch).collect(),
-        surfaces: occs.iter().map(|o| o.surface).collect(),
-    }
+    let arches: BTreeSet<Arch> = occs.iter().map(|o| o.arch).collect();
+    let surfaces: BTreeSet<Surface> = occs.iter().map(|o| o.surface).collect();
+    // Open (∞) iff the variant reaches the newest version captured *for its own
+    // arch+surface* — not the global newest, or an uncaptured (arch × newer-version)
+    // cell would masquerade as a supersession (see `max_version_over`).
+    let max_ordinal =
+        if Some(max_occ) == axis.max_version_over(&arches, &surfaces) { None } else { Some(max_occ) };
+    Gate { min_ordinal, max_ordinal, arches, surfaces }
 }
 
 /// A variant whose occurrences do **not** form a clean version-interval × arch ×
@@ -643,6 +736,33 @@ mod tests {
         assert_eq!(
             test_gate(100, None, &[Arch::X86_64, Arch::Aarch64]).cfg_predicate(&ax).as_deref(),
             Some("any(target_arch = \"x86_64\", target_arch = \"aarch64\")")
+        );
+    }
+
+    #[test]
+    fn partial_capture_does_not_mis_bound_a_missing_arch_version() {
+        // win11 (114) captured ONLY for x64; win10 (100) for both x64 and x86.
+        let mut axis = CapturedAxis::default();
+        for (o, a) in [(100, Arch::X86_64), (114, Arch::X86_64), (100, Arch::X86)] {
+            axis.versions.insert(o);
+            axis.arches.insert(a);
+            axis.surfaces.insert(Surface::User);
+            axis.cells.insert(Occ { ordinal: o, arch: a, surface: Surface::User });
+        }
+        // An x86-only variant last seen at win10 reaches x86's *newest capture*, so it
+        // is OPEN — not bounded. Bounding it (not(feature="win11")) would make it vanish
+        // on a legitimate (x86, win11) build even though win11-x86 was never captured.
+        let g = derive_gate(&BTreeSet::from([occ(100, Arch::X86)]), &axis);
+        assert_eq!(g.max_ordinal, None, "x86 variant reaches x86's newest capture => open");
+        assert_eq!(g.cfg_predicate(&axis).as_deref(), Some("target_arch = \"x86\""));
+
+        // A genuinely-superseded x64 variant (x64 DID capture 114) stays bounded, and
+        // gates off at x64's next captured version.
+        let g2 = derive_gate(&BTreeSet::from([occ(100, Arch::X86_64)]), &axis);
+        assert_eq!(g2.max_ordinal, Some(100));
+        assert_eq!(
+            g2.cfg_predicate(&axis).as_deref(),
+            Some("all(not(feature = \"win11\"), target_arch = \"x86_64\")")
         );
     }
 
